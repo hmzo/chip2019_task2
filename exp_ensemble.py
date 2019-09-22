@@ -4,7 +4,7 @@ import numpy as np
 binary_classifier_threshold = 0.5
 
 test = pd.read_csv(
-    "/home/hmz/PycharmProjects/chip-keras/data/base_bert_stacking_new_test.csv")
+    "./data/base_bert_stacking_new_test.csv")
 
 preds = []
 ids = []
@@ -16,4 +16,4 @@ for i, row in test.iterrows():
     ids.append(row['id'])
 
 pd.DataFrame({"id": np.array(ids, np.int32), "label": preds}).to_csv(
-    "/home/hmz/PycharmProjects/chip-keras/output/ensemble_10_fold_valid_by_experience.csv", index=False)
+    "./output/ensemble_10_fold_valid_by_experience.csv", index=False)

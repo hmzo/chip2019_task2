@@ -17,8 +17,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-ROOT = Path("/home/hmz/PycharmProjects/chip-keras/data")
-MODEL_SAVED = Path("/home/hmz/PycharmProjects/chip-keras/model_saved")
+ROOT = Path("./data")
+MODEL_SAVED = Path("./model_saved")
 
 if not os.path.exists(MODEL_SAVED):
     os.makedirs(MODEL_SAVED)
@@ -302,10 +302,10 @@ def predict(model, weights_path, test_ds):
     _valid_logits = pd.DataFrame({"id": ids, "logits": probs})
 
     _valid_result.to_csv(
-        "/home/hmz/PycharmProjects/chip-keras/output/_valid_result.csv",
+        "./output/_valid_result.csv",
         index=False)
     _valid_logits.to_csv(
-        "/home/hmz/PycharmProjects/chip-keras/output/_valid_logits.csv",
+        "./output/_valid_logits.csv",
         index=False)
 
 

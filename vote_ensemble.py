@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 
 all_test_pred = pd.read_csv(
-    "/home/hmz/PycharmProjects/chip-keras/data/base_bert_predictions_for_vote.csv")
+    "./data/base_bert_predictions_for_vote.csv")
 
 preds = []
 ids = all_test_pred["id"]
@@ -21,4 +21,4 @@ for _, row in all_test_pred.iterrows():
         preds.append(0)
 
 pd.DataFrame({"id": np.array(ids, np.int32), "label": np.array(preds, np.int32)}).to_csv(
-    "/home/hmz/PycharmProjects/chip-keras/output/ensemble_10_fold_valid_by_vote.csv", index=False)
+    "./output/ensemble_10_fold_valid_by_vote.csv", index=False)

@@ -19,9 +19,9 @@ latent_dim = 8
 mode = None
 binary_classifier_threshold = 0.5
 np.random.seed(123)
-ROOT = Path("/home/hmz/PycharmProjects/chip-keras/data")
-OUTPUT = Path("/home/hmz/PycharmProjects/chip-keras/output")
-MODEL_SAVED = Path("/home/hmz/PycharmProjects/chip-keras/model_saved")
+ROOT = Path("./data")
+OUTPUT = Path("./output")
+MODEL_SAVED = Path("./model_saved")
 
 
 data = []
