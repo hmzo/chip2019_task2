@@ -1,13 +1,18 @@
 from pathlib import Path
 import numpy as np
 import pandas as pd
-import codecs
+import sqlite3
 import os
 import logging
+import jieba
+from typing import List, Tuple
+from overrides import overrides
+
+import tensorflow as tf
 
 import keras.backend as K
 from sklearn.metrics import f1_score, precision_score, recall_score
-from keras.layers import Input, Embedding, Lambda, Dense
+from keras.layers import *
 from keras.models import Model
 from keras.optimizers import Adam
 from keras.callbacks import Callback, EarlyStopping
@@ -15,40 +20,76 @@ from keras.callbacks import Callback, EarlyStopping
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
 ROOT = Path("./data")
 MODEL_SAVED = Path("./model_saved")
 OUTPUT = Path("./output")
+WORD_VEC_PATH = Path()
 
 if not os.path.exists(MODEL_SAVED):
     os.makedirs(MODEL_SAVED)
 
-
 mode = None
 np.random.seed(123)
-learning_rate = 5e-3
-min_learning_rate = 1e-3
+learning_rate = 5e-4
+min_learning_rate = 1e-4
 binary_classifier_threshold = 0.5
-
+tokenize = jieba.cut
 
 categories = ["aids", "breast_cancer", "diabetes", "hepatitis", "hypertension"]
 
-
+token_set = set()
 data = []
 for index, row in pd.read_csv(ROOT / "train.csv").iterrows():
+    tokenized_q1 = [x for x in tokenize(row['question1'])]
+    tokenized_q2 = [x for x in tokenize(row['question2'])]
     data.append(
-        (row['question1'],
-         row['question2'],
+        (tokenized_q1,  # do not append generator
+         tokenized_q2,
          row['category'],
          row['label']))
+    for token in tokenized_q1:
+        token_set.add(token)
+    for token in tokenized_q2:
+        token_set.add(token)
 
 test_data = []
 for index, row in pd.read_csv(ROOT / "dev_id.csv").iterrows():
+    tokenized_q1 = [x for x in tokenize(row['question1'])]
+    tokenized_q2 = [x for x in tokenize(row['question2'])]
     test_data.append(
-        (row['question1'],
-         row['question2'],
+        (tokenized_q1,
+         tokenized_q2,
          row['category'],
          row['id']))
+    for token in tokenized_q1:
+        token_set.add(token)
+    for token in tokenized_q2:
+        token_set.add(token)
+
+token_index = dict((x, i + 2) for i, x in enumerate(sorted(token_set)))
+token_index.update({"<pad>": 0})  # PAD
+token_index.update({"<unk>": 1})  # UNK
+index_token = dict((i, x) for x, i in token_index.items())
+
+# w2v embedding (tencent)
+conn = sqlite3.connect('./data/w2v.db')
+c = conn.cursor()
+oov_count = 0
+embedding = np.zeros(shape=(len(token_index), 200), dtype=np.float32)
+for word, index in token_index.items():
+    try:
+        vec_str = c.execute(
+            "SELECT vector FROM tencent_w2v WHERE word=?", (word,)).fetchall()[0][0]
+        embedding[index] = np.fromstring(vec_str, np.float32)
+    except IndexError:
+        oov_count += 1
+        embedding[index] = np.random.uniform(-1, 1, (200,)).astype(np.float32)
+        logger.info("%s is not included in this database." % word)
+        continue
+embedding[0] = np.zeros((200,), np.float32)
+logger.info("%d words is out of vocabulary." % oov_count)
+conn.commit()
+conn.close()
 
 
 class Evaluator(Callback):
@@ -117,6 +158,11 @@ class Evaluator(Callback):
 
 class DataGenerator:
     def __init__(self, data, batch_size=32, test=False):
+        """
+        data format:
+            train or valid: [token_list_of q1, token_list_of_q2, category, label]
+            test:           [token_list_of q1, token_list_of_q2, category, id   ]
+        """
         self.data = data
         self.batch_size = batch_size
         self.steps = len(self.data) // self.batch_size
@@ -139,9 +185,40 @@ class DataGenerator:
     def iterator(self):
         while True:
             if not self.test:
-                raise NotImplementedError
+                X1, X2, C, Y = [], [], [], []
+                for i in self.idxs:
+                    d = self.data[i]
+                    x1, x2 = [token_index[x] for x in d[0]], [token_index[x] for x in d[1]]
+                    c, y = d[2], d[3]
+                    X1.append(x1)
+                    X2.append(x2)
+                    C.append([categories.index(c)])
+                    Y.append([y])
+                    if len(X1) == self.batch_size or i == self.idxs[-1]:
+                        X1 = seq_padding(X1)
+                        X2 = seq_padding(X2)
+                        C = seq_padding(C)
+                        Y = seq_padding(Y)
+                        # todo: too abundant to use the generator
+                        yield [X1, X2, C, Y], None
+                        X1, X2, C, Y = [], [], [], []
             elif self.test:
-                raise NotImplementedError
+                X1, X2, C = [], [], []
+                for i in range(len(self.data)):
+                    d = self.data[i]
+                    x1, x2 = [
+                        token_index[x] for x in d[0]], [
+                        token_index[x] for x in d[1]]
+                    c = d[2]
+                    X1.append(x1)
+                    X2.append(x2)
+                    C.append([categories.index(c)])
+                    if len(X1) == self.batch_size or i == len(self.data) - 1:
+                        X1 = seq_padding(X1)
+                        X2 = seq_padding(X2)
+                        C = seq_padding(C)
+                        yield [X1, X2, C], None
+                        X1, X2, C = [], [], []
 
     def _get_all_label_as_ndarray(self):
         if self.test:
@@ -160,8 +237,64 @@ class DataGenerator:
         return np.array(all_ids, dtype=np.int32)
 
 
-def create_esim_model() -> [Model, Model]:
-    raise NotImplementedError
+class CoAttentionAndCombine(Layer):
+    def __init__(self, atype):
+        super(CoAttentionAndCombine, self).__init__()
+        self.supports_masking = True
+        self.atype = atype
+
+    def build(self, input_shape):
+        # Used purely for shape validation.
+        if len(input_shape) != 2:
+            raise ValueError(
+                'A `CoAttentionAndCombine` layer should be called '
+                'on a list of 2 inputs')
+        if all([shape is None for shape in input_shape]):
+            return
+        inputs_shapes = [list(shape)
+                         for shape in input_shape]  # (x1, m1, x2, m2)
+        if self.atype == 'bi_linear':
+            self.bi_linear_w = self.add_weight(name='bi_linear_w',
+                                               initializer='random_normal',
+                                               shape=(inputs_shapes[0][-1], inputs_shapes[0][-1]),
+                                               trainable=True)
+        self.built = True
+
+    def call(self, inputs, **kwargs):
+        x1 = inputs[0]
+        x2 = inputs[1]
+        similarity_matrix: object = None
+        if self.atype == 'dot':
+            # (batch_size, seq_len1, seq_len2)
+            similarity_matrix = tf.matmul(x1, x2, transpose_b=True)
+        elif self.atype == 'bi_linear':
+            similarity_matrix = tf.matmul(
+                tf.tensordot(
+                    x1, self.bi_linear_w, [
+                        [2], [0]]), x2, transpose_b=True)
+        assert similarity_matrix is not None, "type %s is not in ['dot', 'bi_linear']" % self.atype
+
+        similarity_matrix_transpose = tf.transpose(
+            similarity_matrix, perm=[0, 2, 1])
+
+        alpha1 = tf.nn.softmax(similarity_matrix_transpose, axis=-1)
+        alpha2 = tf.nn.softmax(similarity_matrix, axis=-1)
+
+        x1_tilde = tf.matmul(alpha2, x2)
+        x2_tilde = tf.matmul(alpha1, x1)
+
+        m1 = tf.concat([x1, x1_tilde, tf.abs(tf.subtract(
+            x1, x1_tilde)), tf.multiply(x1, x1_tilde)], axis=-1)
+        m2 = tf.concat([x2, x2_tilde, tf.abs(tf.subtract(
+            x2, x2_tilde)), tf.multiply(x2, x2_tilde)], axis=-1)
+        output: List = [m1, m2]  # ***output must be a List***
+        return output
+
+    def compute_output_shape(self, input_shape: List[Tuple]) -> List[Tuple]:
+        output_shapes: List[Tuple] = list()  # ***element must be a tuple***
+        for x in input_shape:
+            output_shapes.append((x[0], x[1], 4 * x[2]))
+        return output_shapes
 
 
 def seq_padding(seqs, padding=0):
@@ -171,8 +304,74 @@ def seq_padding(seqs, padding=0):
                      if len(x) < max_len else x for x in seqs])
 
 
-def train(train_model, train_ds, valid_ds, model_name):
+def create_esim_model(atype='bi_linear') -> [Model, Model]:
+    x1_in = Input(shape=(None,))
+    x2_in = Input(shape=(None,))
+    c_in = Input(shape=(None,))
+    y_in = Input(shape=(None,))
 
+    embed_layer = Embedding(input_dim=len(token_index), output_dim=200,
+                            weights=[embedding],
+                            trainable=False,
+                            mask_zero=True)  # keras' mask mechanism is NIUBI,
+    # the mask schema: if embedding's mask_zero is True, mask(input) ->
+    # layer/model operation -> output
+    x1_embed_dropout = Dropout(0.5)(embed_layer(x1_in))
+    x2_embed_dropout = Dropout(0.5)(embed_layer(x2_in))
+
+    input_encoder = Bidirectional(LSTM(units=200,
+                                       activation="relu",
+                                       return_sequences=True,
+                                       recurrent_dropout=0.3,
+                                       dropout=0.3))
+    x1_bar = input_encoder(x1_embed_dropout)
+
+    x2_bar = input_encoder(x2_embed_dropout)
+
+    local_inference = CoAttentionAndCombine(atype=atype)
+
+    x1_combined, x2_combined = local_inference([x1_bar, x2_bar])
+
+    inference_composition = Bidirectional(LSTM(units=200,
+                                               activation="relu",
+                                               return_sequences=True,
+                                               recurrent_dropout=0.3,
+                                               dropout=0.3))
+    x1_compared = inference_composition(x1_combined)
+    x2_compared = inference_composition(x2_combined)
+
+    def reduce_mean_closure(x):
+        return tf.reduce_mean(x, axis=1)
+
+    def reduce_max_closure(x):
+        return tf.reduce_max(x, axis=1)
+    avg_op = Lambda(reduce_mean_closure)
+    max_op = Lambda(reduce_max_closure)
+
+    x1_avg = avg_op(x1_compared)
+    x1_max = max_op(x1_compared)
+    x2_avg = avg_op(x2_compared)
+    x2_max = max_op(x2_compared)
+
+    x1_rep = Concatenate()([x1_avg, x1_max])
+    x2_rep = Concatenate()([x2_avg, x2_max])
+
+    merge_features = Dropout(0.5)(Concatenate()([x1_rep, x2_rep]))
+    p = Dense(1, activation='sigmoid')(merge_features)
+
+    train_model = Model([x1_in, x2_in, c_in, y_in], p)
+    model = Model([x1_in, x2_in, c_in], p)
+
+    loss = K.mean(K.binary_crossentropy(target=y_in, output=p))
+    train_model.add_loss(loss)
+
+    train_model.compile(optimizer=Adam(learning_rate))
+    train_model.summary()
+
+    return train_model, model
+
+
+def train(train_model, train_ds, valid_ds, model_name):
     evaluator = Evaluator(model_name=model_name, valid_ds=valid_ds)
     early_stopping = EarlyStopping(monitor='val_loss', patience=10, verbose=1)
 
@@ -214,7 +413,10 @@ def predict(model, weights_path, test_ds, valid_result_name, valid_logits_name):
 def gen_stacking_features(weights_root_path, model_name):
     valid_true_labels = []
     valid_probs = []
-    mode_test_ds = DataGenerator(test_data, batch_size=32, test=True)
+    mode_test_ds = DataGenerator(
+        test_data,
+        batch_size=32,
+        test=True)
     test_ids = mode_test_ds.ID
     test_probs = []
     for weight in os.listdir(weights_root_path):
@@ -227,7 +429,10 @@ def gen_stacking_features(weights_root_path, model_name):
             j in enumerate(random_order) if i %
             10 == _mode]
 
-        mode_valid_ds = DataGenerator(_valid_data, batch_size=32, test=False)
+        mode_valid_ds = DataGenerator(
+            _valid_data,
+            batch_size=32,
+            test=False)
         valid_true_labels.append(mode_valid_ds.all_labels)
 
         valid_probs.append(
@@ -252,7 +457,8 @@ def gen_stacking_features(weights_root_path, model_name):
     to_vote_format = {"id": test_ids}
     for i, each in enumerate(test_probs):
         to_vote_format["label_%s" % str(i)] = np.array(each.round(), np.int32)
-    pd.DataFrame(to_vote_format).to_csv(ROOT / (model_name + "_predictions_for_vote.csv"), index=False)
+    pd.DataFrame(to_vote_format).to_csv(
+        ROOT / (model_name + "_predictions_for_vote.csv"), index=False)
 
     valid_out = pd.DataFrame({"probs": np.concatenate(
         valid_probs), "label": np.array(np.concatenate(valid_true_labels), np.int32)})
@@ -267,7 +473,7 @@ def gen_stacking_features(weights_root_path, model_name):
 
 
 if __name__ == "__main__":
-    # 按照9:1的比例划分训练集和验证集
+    # # 按照9:1的比例划分训练集和验证集
     random_order = [x for x in range(len(data))]
     np.random.shuffle(random_order)
 
@@ -281,10 +487,19 @@ if __name__ == "__main__":
             j in enumerate(random_order) if i %
             10 == mode]
 
-        _train_ds = DataGenerator(train_data, batch_size=32, test=False)
-        _valid_ds = DataGenerator(valid_data, batch_size=32, test=False)
+        _train_ds = DataGenerator(
+            train_data,
+            batch_size=32,
+            test=False)
+        _valid_ds = DataGenerator(
+            valid_data,
+            batch_size=32,
+            test=False)
 
-        _test_ds = DataGenerator(test_data, batch_size=32, test=True)
+        _test_ds = DataGenerator(
+            test_data,
+            batch_size=32,
+            test=True)
 
         _train_model, _model = create_esim_model()
 
