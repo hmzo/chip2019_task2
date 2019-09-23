@@ -102,7 +102,7 @@ class Evaluator(Callback):
         if not os.path.exists(self._model_saved):
             os.makedirs(self._model_saved)
 
-    def on_epoch_begin(self, epoch, logs=None):
+    def on_batch_begin(self, epoch, logs=None):
         if self.passed < self.params['steps']:
             lr = (self.passed + 1.) / self.params['steps'] * learning_rate
             K.set_value(self.model.optimizer.lr, lr)
