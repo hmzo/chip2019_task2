@@ -76,6 +76,7 @@ conn = sqlite3.connect('./data/w2v.db')
 c = conn.cursor()
 oov_count = 0
 embedding = np.zeros(shape=(len(token_index), 200), dtype=np.float32)
+f = open("./oov.txt", 'w')
 for word, index in token_index.items():
     try:
         vec_str = c.execute(
@@ -83,13 +84,15 @@ for word, index in token_index.items():
         embedding[index] = np.fromstring(vec_str, np.float32)
     except IndexError:
         oov_count += 1
+        f.write(word + '\n')
         embedding[index] = np.random.uniform(-1, 1, (200,)).astype(np.float32)
-        logger.info("%s is not included in this database." % word)
+        logger.debug("%s is not included in this database." % word)
         continue
 embedding[0] = np.zeros((200,), np.float32)
 logger.info("%d words is out of vocabulary." % oov_count)
 conn.commit()
 conn.close()
+f.close()
 
 
 class Evaluator(Callback):
@@ -377,7 +380,7 @@ def train(train_model, train_ds, valid_ds, model_name):
 
     train_model.fit_generator(train_ds.iterator(),
                               steps_per_epoch=len(train_ds),
-                              epochs=50,
+                              epochs=100,
                               validation_data=valid_ds.iterator(),
                               validation_steps=len(valid_ds),
                               callbacks=[evaluator, early_stopping])
@@ -415,7 +418,7 @@ def gen_stacking_features(weights_root_path, model_name):
     valid_probs = []
     mode_test_ds = DataGenerator(
         test_data,
-        batch_size=32,
+        batch_size=128,
         test=True)
     test_ids = mode_test_ds.ID
     test_probs = []
@@ -431,7 +434,7 @@ def gen_stacking_features(weights_root_path, model_name):
 
         mode_valid_ds = DataGenerator(
             _valid_data,
-            batch_size=32,
+            batch_size=128,
             test=False)
         valid_true_labels.append(mode_valid_ds.all_labels)
 
@@ -489,16 +492,16 @@ if __name__ == "__main__":
 
         _train_ds = DataGenerator(
             train_data,
-            batch_size=32,
+            batch_size=128,
             test=False)
         _valid_ds = DataGenerator(
             valid_data,
-            batch_size=32,
+            batch_size=128,
             test=False)
 
         _test_ds = DataGenerator(
             test_data,
-            batch_size=32,
+            batch_size=128,
             test=True)
 
         _train_model, _model = create_esim_model()

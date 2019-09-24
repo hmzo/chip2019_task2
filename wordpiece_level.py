@@ -276,7 +276,7 @@ def train(train_model, train_ds, valid_ds, model_name):
 
     train_model.fit_generator(train_ds.iterator(),
                               steps_per_epoch=len(train_ds),
-                              epochs=50,
+                              epochs=100,
                               validation_data=valid_ds.iterator(),
                               validation_steps=len(valid_ds),
                               callbacks=[evaluator, early_stopping])
