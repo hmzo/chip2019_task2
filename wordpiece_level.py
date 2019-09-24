@@ -10,7 +10,7 @@ from sklearn.metrics import f1_score, precision_score, recall_score
 from keras.layers import Input, Embedding, Lambda, Dense
 from keras.models import Model
 from keras.optimizers import Adam
-from keras.callbacks import Callback, EarlyStopping
+from keras.callbacks import Callback
 from keras_bert import load_trained_model_from_checkpoint, Tokenizer, get_base_dict
 
 logging.basicConfig(level=logging.INFO)
@@ -33,6 +33,11 @@ config_path = './bert/bert_config.json'
 checkpoint_path = './bert/bert_model.ckpt'
 dict_path = './bert/vocab.txt'
 
+random_order_2000 = np.fromfile("./random_order_2000.npy", np.int32)
+random_order_2500 = np.fromfile("./random_order_2500.npy", dtype=np.int32)
+random_order_10000 = np.fromfile("./random_order_10000.npy", dtype=np.int32)
+random_order_18000 = np.fromfile("./random_order_18000.npy", dtype=np.int32)
+
 
 categories = ["aids", "breast_cancer", "diabetes", "hepatitis", "hypertension"]
 
@@ -45,13 +50,38 @@ with codecs.open(dict_path, 'r', 'utf-8') as reader:
 
 tokenizer = Tokenizer(token_dict)
 
-data = []
+aids_data = []
+breast_cancer_data = []
+diabetes_data = []
+hepatitis_data = []
+hypertension_data = []
 for index, row in pd.read_csv(ROOT / "train.csv").iterrows():
-    data.append(
-        (row['question1'],
-         row['question2'],
-         row['category'],
-         row['label']))
+    if row["category"] == "aids":
+        aids_data.append((row['question1'],
+                          row['question2'],
+                          row['category'],
+                          row['label']))
+
+    elif row["category"] == "breast_cancer":
+        breast_cancer_data.append((row['question1'],
+                                   row['question2'],
+                                   row['category'],
+                                   row['label']))
+    elif row["category"] == "diabetes":
+        diabetes_data.append((row['question1'],
+                              row['question2'],
+                              row['category'],
+                              row['label']))
+    elif row["category"] == "hepatitis":
+        hepatitis_data.append((row['question1'],
+                               row['question2'],
+                               row['category'],
+                               row['label']))
+    elif row["category"] == "hypertension":
+        hypertension_data.append((row['question1'],
+                                  row['question2'],
+                                  row['category'],
+                                  row['label']))
 
 test_data = []
 for index, row in pd.read_csv(ROOT / "dev_id.csv").iterrows():
@@ -63,10 +93,13 @@ for index, row in pd.read_csv(ROOT / "dev_id.csv").iterrows():
 
 
 class Evaluator(Callback):
-    def __init__(self, model_name, valid_ds):
+    def __init__(self, model_name, valid_ds, patience):
         super(Evaluator, self).__init__()
         self._best_f1 = 0.
         self.passed = 0
+        self.best_epoch = -1
+        self.epochs = 0
+        self.patience = patience
         self._model_saved = MODEL_SAVED / model_name
         self.valid_ds = valid_ds
         if not os.path.exists(self._model_saved):
@@ -105,6 +138,7 @@ class Evaluator(Callback):
               "\t-val_p_measure: ", round(_val_precision, 4),
               "\t-val_r_measure: ", round(_val_recall, 4))
         if _val_f1 > self._best_f1:
+            self.best_epoch = self.epochs
             assert isinstance(mode, int), "check mode, must be a integer"
             file_names = os.listdir(self._model_saved)
             for fn in file_names:
@@ -125,6 +159,11 @@ class Evaluator(Callback):
                                      (str(mode), str(round(_val_f1, 4)))))
             self._best_f1 = _val_f1
 
+        if self.best_epoch - self.best_epoch > self.patience:
+            self.model.stop_training = True
+            logger.info("%d epochs have no improvement, earlystoping cased..." % self.patience)
+        self.epochs += 1
+
 
 class DataGenerator:
     def __init__(self, data, batch_size=32, test=False):
@@ -137,8 +176,10 @@ class DataGenerator:
 
         if not test:
             logger.info("__Shuffle the dataset__")
-            self.idxs = [x for x in range(len(self.data))]
-            np.random.shuffle(self.idxs)
+            if len(self.data) == 2000:
+                self.idxs = random_order_2000
+            elif len(self.data) == 18000:
+                self.idxs = random_order_18000
             self.all_labels = self._get_all_label_as_ndarray()
             self.all_labels = self.all_labels[self.idxs]
         else:
@@ -271,15 +312,14 @@ def create_bert_concat_category_embedding_model():
 
 def train(train_model, train_ds, valid_ds, model_name):
 
-    evaluator = Evaluator(model_name=model_name, valid_ds=valid_ds)
-    early_stopping = EarlyStopping(monitor='val_loss', patience=10, verbose=1)
+    evaluator = Evaluator(model_name=model_name, valid_ds=valid_ds, patience=10)
 
     train_model.fit_generator(train_ds.iterator(),
                               steps_per_epoch=len(train_ds),
                               epochs=100,
                               validation_data=valid_ds.iterator(),
                               validation_steps=len(valid_ds),
-                              callbacks=[evaluator, early_stopping])
+                              callbacks=[evaluator])
 
 
 def predict(model, weights_path, test_ds):
@@ -320,10 +360,11 @@ def gen_stacking_features(weights_root_path, model_name):
         train_model, _ = create_base_bert_model()  # todo: be easy to modify it
         train_model.load_weights(weights_root_path / weight)
 
-        _valid_data = [
-            data[j] for i,
-            j in enumerate(random_order) if i %
-            10 == _mode]
+        _valid_data = [aids_data[j] for i, j in enumerate(random_order_2500) if i % 10 == _mode] + \
+                      [hypertension_data[j] for i, j in enumerate(random_order_2500) if i % 10 == _mode] + \
+                      [hepatitis_data[j] for i, j in enumerate(random_order_2500) if i % 10 == _mode] + \
+                      [breast_cancer_data[j] for i, j in enumerate(random_order_2500) if i % 10 == _mode] + \
+                      [diabetes_data[j] for i, j in enumerate(random_order_10000) if i % 10 == _mode]
 
         mode_valid_ds = DataGenerator(_valid_data, batch_size=32, test=False)
         valid_true_labels.append(mode_valid_ds.all_labels)
@@ -366,19 +407,19 @@ def gen_stacking_features(weights_root_path, model_name):
 
 if __name__ == "__main__":
     # 按照9:1的比例划分训练集和验证集
-    np.random.seed(123)
-    random_order = [x for x in range(len(data))]
-    np.random.shuffle(random_order)
 
     for mode in range(10):
-        train_data = [
-            data[j] for i,
-            j in enumerate(random_order) if i %
-            10 != mode]
-        valid_data = [
-            data[j] for i,
-            j in enumerate(random_order) if i %
-            10 == mode]
+        train_data = [aids_data[j] for i, j in enumerate(random_order_2500) if i % 10 != mode] + \
+                     [hypertension_data[j] for i, j in enumerate(random_order_2500) if i % 10 != mode] + \
+                     [hepatitis_data[j] for i, j in enumerate(random_order_2500) if i % 10 != mode] + \
+                     [breast_cancer_data[j] for i, j in enumerate(random_order_2500) if i % 10 != mode] + \
+                     [diabetes_data[j] for i, j in enumerate(random_order_10000) if i % 10 != mode]
+
+        valid_data = [aids_data[j] for i, j in enumerate(random_order_2500) if i % 10 == mode] + \
+                     [hypertension_data[j] for i, j in enumerate(random_order_2500) if i % 10 == mode] + \
+                     [hepatitis_data[j] for i, j in enumerate(random_order_2500) if i % 10 == mode] + \
+                     [breast_cancer_data[j] for i, j in enumerate(random_order_2500) if i % 10 == mode] + \
+                     [diabetes_data[j] for i, j in enumerate(random_order_10000) if i % 10 == mode]
 
         _train_ds = DataGenerator(train_data, batch_size=32, test=False)
         _valid_ds = DataGenerator(valid_data, batch_size=32, test=False)

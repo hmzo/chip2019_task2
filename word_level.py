@@ -5,6 +5,8 @@ import sqlite3
 import os
 import logging
 import jieba
+import thulac
+import pkuseg
 from typing import List, Tuple
 from overrides import overrides
 
@@ -15,7 +17,7 @@ from sklearn.metrics import f1_score, precision_score, recall_score
 from keras.layers import *
 from keras.models import Model
 from keras.optimizers import Adam
-from keras.callbacks import Callback, EarlyStopping
+from keras.callbacks import Callback
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -25,32 +27,64 @@ MODEL_SAVED = Path("./model_saved")
 OUTPUT = Path("./output")
 WORD_VEC_PATH = Path()
 
+random_order_2000 = np.fromfile("./random_order_2000.npy", dtype=np.int32)
+random_order_10000 = np.fromfile("./random_order_10000.npy", dtype=np.int32)
+random_order_2500 = np.fromfile("./random_order_2500.npy", dtype=np.int32)
+random_order_18000 = np.fromfile("./random_order_18000.npy", dtype=np.int32)
+
 if not os.path.exists(MODEL_SAVED):
     os.makedirs(MODEL_SAVED)
 
 mode = None
-np.random.seed(123)
+freq = 2
 learning_rate = 4e-4
 min_learning_rate = 1e-4
 binary_classifier_threshold = 0.5
 tokenize = jieba.cut
+# tokenize = pkuseg.pkuseg(model_name='medicine').cut
+# tokenize = thulac.thulac().cut
 
 categories = ["aids", "breast_cancer", "diabetes", "hepatitis", "hypertension"]
 
-token_set = set()
-data = []
+token_count = dict()
+aids_data = []
+breast_cancer_data = []
+diabetes_data = []
+hepatitis_data = []
+hypertension_data = []
 for index, row in pd.read_csv(ROOT / "train.csv").iterrows():
-    tokenized_q1 = [x for x in tokenize(row['question1'])]
-    tokenized_q2 = [x for x in tokenize(row['question2'])]
-    data.append(
-        (tokenized_q1,  # do not append generator
-         tokenized_q2,
-         row['category'],
-         row['label']))
+    tokenized_q1 = [x[0] for x in tokenize(row['question1'])]
+    tokenized_q2 = [x[0] for x in tokenize(row['question2'])]
+    if row["category"] == "aids":
+        aids_data.append((tokenized_q1,
+                          tokenized_q2,
+                          row['category'],
+                          row['label']))
+
+    elif row["category"] == "breast_cancer":
+        breast_cancer_data.append((tokenized_q1,
+                                   tokenized_q2,
+                                   row['category'],
+                                   row['label']))
+    elif row["category"] == "diabetes":
+        diabetes_data.append((tokenized_q1,
+                              tokenized_q2,
+                              row['category'],
+                              row['label']))
+    elif row["category"] == "hepatitis":
+        hepatitis_data.append((tokenized_q1,
+                               tokenized_q2,
+                               row['category'],
+                               row['label']))
+    elif row["category"] == "hypertension":
+        hypertension_data.append((tokenized_q1,
+                                  tokenized_q2,
+                                  row['category'],
+                                  row['label']))
     for token in tokenized_q1:
-        token_set.add(token)
+        token_count[token] = token_count.get(token, 0) + 1
     for token in tokenized_q2:
-        token_set.add(token)
+        token_count[token] = token_count.get(token, 0) + 1
 
 test_data = []
 for index, row in pd.read_csv(ROOT / "dev_id.csv").iterrows():
@@ -62,13 +96,14 @@ for index, row in pd.read_csv(ROOT / "dev_id.csv").iterrows():
          row['category'],
          row['id']))
     for token in tokenized_q1:
-        token_set.add(token)
+        token_count[token] = token_count.get(token, 0) + 1
     for token in tokenized_q2:
-        token_set.add(token)
+        token_count[token] = token_count.get(token, 0) + 1
 
-token_index = dict((x, i + 2) for i, x in enumerate(sorted(token_set)))
-token_index.update({"<pad>": 0})  # PAD
-token_index.update({"<unk>": 1})  # UNK
+token_index = {"<pad>": 0, "<unk>": 1}
+for token, count in token_count.items():
+    if count > freq:
+        token_index[token] = len(token_index)
 index_token = dict((i, x) for x, i in token_index.items())
 
 # w2v embedding (tencent)
@@ -96,26 +131,17 @@ f.close()
 
 
 class Evaluator(Callback):
-    def __init__(self, model_name, valid_ds):
+    def __init__(self, model_name, valid_ds, patience):
         super(Evaluator, self).__init__()
         self._best_f1 = 0.
         self.passed = 0
+        self.best_epoch = -1
+        self.epochs = 0
+        self.patience = patience
         self._model_saved = MODEL_SAVED / model_name
         self.valid_ds = valid_ds
         if not os.path.exists(self._model_saved):
             os.makedirs(self._model_saved)
-
-    def on_batch_begin(self, epoch, logs=None):
-        if self.passed < self.params['steps']:
-            lr = (self.passed + 1.) / self.params['steps'] * learning_rate
-            K.set_value(self.model.optimizer.lr, lr)
-            self.passed += 1
-        elif self.params['steps'] <= self.passed < self.params['steps'] * 2:
-            lr = (2 - (self.passed + 1.) /
-                  self.params['steps']) * (learning_rate - min_learning_rate)
-            lr += min_learning_rate
-            K.set_value(self.model.optimizer.lr, lr)
-            self.passed += 1
 
     def on_epoch_end(self, epoch, logs=None):
         val_predict = (
@@ -138,6 +164,7 @@ class Evaluator(Callback):
               "\t-val_p_measure: ", round(_val_precision, 4),
               "\t-val_r_measure: ", round(_val_recall, 4))
         if _val_f1 > self._best_f1:
+            self.best_epoch = self.epochs
             assert isinstance(mode, int), "check mode, must be a integer"
             file_names = os.listdir(self._model_saved)
             for fn in file_names:
@@ -158,6 +185,11 @@ class Evaluator(Callback):
                                      (str(mode), str(round(_val_f1, 4)))))
             self._best_f1 = _val_f1
 
+        if self.best_epoch - self.best_epoch > self.patience:
+            self.model.stop_training = True
+            logger.info("%d epochs have no improvement, earlystoping cased..." % self.patience)
+        self.epochs += 1
+
 
 class DataGenerator:
     def __init__(self, data, batch_size=32, test=False):
@@ -175,8 +207,10 @@ class DataGenerator:
 
         if not test:
             logger.info("__Shuffle the dataset__")
-            self.idxs = [x for x in range(len(self.data))]
-            np.random.shuffle(self.idxs)
+            if len(self.data) == 2000:
+                self.idxs = random_order_2000
+            elif len(self.data) == 18000:
+                self.idxs = random_order_18000
             self.all_labels = self._get_all_label_as_ndarray()
             self.all_labels = self.all_labels[self.idxs]
         else:
@@ -191,7 +225,7 @@ class DataGenerator:
                 X1, X2, C, Y = [], [], [], []
                 for i in self.idxs:
                     d = self.data[i]
-                    x1, x2 = [token_index[x] for x in d[0]], [token_index[x] for x in d[1]]
+                    x1, x2 = [token_index.get(x, 1) for x in d[0]], [token_index.get(x, 1) for x in d[1]]
                     c, y = d[2], d[3]
                     X1.append(x1)
                     X2.append(x2)
@@ -267,7 +301,8 @@ class CoAttentionAndCombine(Layer):
         m1 = tf.expand_dims(inputs[1], axis=2)  # (batch_size, seq_len1, 1)
         x2 = inputs[2]
         m2 = tf.expand_dims(inputs[3], axis=1)  # (batch_size, 1, seq_len2)
-        mask_similarity_matrix = tf.matmul(m1, m2)  # (batch_size, seq_len1, seq_len2)
+        mask_similarity_matrix = tf.matmul(
+            m1, m2)  # (batch_size, seq_len1, seq_len2)
         mask_similarity_matrix = (mask_similarity_matrix - 1.) * 10000
         similarity_matrix: object = None
         if self.atype == 'dot':
@@ -281,7 +316,8 @@ class CoAttentionAndCombine(Layer):
         assert similarity_matrix is not None, "type %s is not in ['dot', 'bi_linear']" % self.atype
 
         similarity_matrix = tf.add(similarity_matrix, mask_similarity_matrix)
-        similarity_matrix_transpose = tf.transpose(similarity_matrix, perm=[0, 2, 1])
+        similarity_matrix_transpose = tf.transpose(
+            similarity_matrix, perm=[0, 2, 1])
 
         alpha1 = tf.nn.softmax(similarity_matrix_transpose, axis=-1)
         alpha2 = tf.nn.softmax(similarity_matrix, axis=-1)
@@ -320,11 +356,12 @@ def create_esim_model(atype='bi_linear') -> [Model, Model]:
     mask1 = Lambda(lambda x: K.cast(K.greater(x, 0), 'float32'))(x1_in)
     mask2 = Lambda(lambda x: K.cast(K.greater(x, 0), 'float32'))(x2_in)
 
-    embed_layer = Embedding(input_dim=len(token_index), output_dim=200,
+    embed_layer = Embedding(input_dim=len(token_index),
+                            output_dim=200,
+                            mask_zero=False,
                             weights=[embedding],
                             trainable=False)  # keras' mask mechanism is NIUBI,
-    # the mask schema: if embedding's mask_zero is True, mask(input) ->
-    # layer/model operation -> output
+    # the mask schema: if embedding's mask_zero is True, mask(input) -> layer/model operation -> output
     # ==> keras's mask is hard to support custom layer. so revise something
 
     x1_embed_dropout = Dropout(0.5)(embed_layer(x1_in))
@@ -352,13 +389,16 @@ def create_esim_model(atype='bi_linear') -> [Model, Model]:
     def reduce_mean_with_mask(x, mask):
         dim = K.int_shape(x)[-1]
         seq_len = K.expand_dims(K.sum(mask, 1), 1)  # (batch_size, 1)
-        seq_len_tiled = K.tile(seq_len, [1, dim])  # (batch_size, dim), unknown to the keras' broadcasting
+        # (batch_size, dim), unknown to the keras' broadcasting
+        seq_len_tiled = K.tile(seq_len, [1, dim])
         x_sum = K.sum(x, axis=1)  # (batch_size, dim)
         return x_sum / seq_len_tiled
 
-    avg_mask1 = lambda x: reduce_mean_with_mask(x, mask1)
-    avg_mask2 = lambda x: reduce_mean_with_mask(x, mask2)
-    max_closure = lambda x: K.max(x, axis=1)
+    def avg_mask1(x): return reduce_mean_with_mask(x, mask1)
+
+    def avg_mask2(x): return reduce_mean_with_mask(x, mask2)
+
+    def max_closure(x): return K.max(x, axis=1)
 
     avg_op1 = Lambda(avg_mask1)
     avg_op2 = Lambda(avg_mask2)
@@ -372,8 +412,9 @@ def create_esim_model(atype='bi_linear') -> [Model, Model]:
     x1_rep = Concatenate()([x1_avg, x1_max])
     x2_rep = Concatenate()([x2_avg, x2_max])
 
-    merge_features = Dropout(0.5)(Concatenate()([x1_rep, x2_rep]))
-    p = Dense(1, activation='sigmoid')(merge_features)
+    merge_features = Concatenate()([x1_rep, x2_rep])
+    hidden = Dropout(0.5)(Dense(200, activation='relu')(merge_features))
+    p = Dense(1, activation='sigmoid')(hidden)
 
     train_model = Model([x1_in, x2_in, c_in, y_in], p)
     model = Model([x1_in, x2_in, c_in], p)
@@ -388,15 +429,14 @@ def create_esim_model(atype='bi_linear') -> [Model, Model]:
 
 
 def train(train_model, train_ds, valid_ds, model_name):
-    evaluator = Evaluator(model_name=model_name, valid_ds=valid_ds)
-    early_stopping = EarlyStopping(monitor='val_loss', patience=20, verbose=1)
+    evaluator = Evaluator(model_name=model_name, valid_ds=valid_ds, patience=10)
 
     train_model.fit_generator(train_ds.iterator(),
                               steps_per_epoch=len(train_ds),
                               epochs=100,
                               validation_data=valid_ds.iterator(),
                               validation_steps=len(valid_ds),
-                              callbacks=[evaluator, early_stopping])
+                              callbacks=[evaluator])
 
 
 def predict(model, weights_path, test_ds, valid_result_name, valid_logits_name):
@@ -440,10 +480,11 @@ def gen_stacking_features(weights_root_path, model_name):
         train_model, _ = create_esim_model()  # todo: be easy to modify it
         train_model.load_weights(weights_root_path / weight)
 
-        _valid_data = [
-            data[j] for i,
-            j in enumerate(random_order) if i %
-            10 == _mode]
+        _valid_data = [aids_data[j] for i, j in enumerate(random_order_2500) if i % 10 == _mode] + \
+                      [hypertension_data[j] for i, j in enumerate(random_order_2500) if i % 10 == _mode] + \
+                      [hepatitis_data[j] for i, j in enumerate(random_order_2500) if i % 10 == _mode] + \
+                      [breast_cancer_data[j] for i, j in enumerate(random_order_2500) if i % 10 == _mode] + \
+                      [diabetes_data[j] for i, j in enumerate(random_order_10000) if i % 10 == _mode]
 
         mode_valid_ds = DataGenerator(
             _valid_data,
@@ -490,18 +531,19 @@ def gen_stacking_features(weights_root_path, model_name):
 
 if __name__ == "__main__":
     # # 按照9:1的比例划分训练集和验证集
-    random_order = [x for x in range(len(data))]
-    np.random.shuffle(random_order)
 
     for mode in range(10):
-        train_data = [
-            data[j] for i,
-            j in enumerate(random_order) if i %
-            10 != mode]
-        valid_data = [
-            data[j] for i,
-            j in enumerate(random_order) if i %
-            10 == mode]
+        train_data = [aids_data[j] for i, j in enumerate(random_order_2500) if i % 10 != mode] + \
+                     [hypertension_data[j] for i, j in enumerate(random_order_2500) if i % 10 != mode] +\
+                     [hepatitis_data[j] for i, j in enumerate(random_order_2500) if i % 10 != mode] + \
+                     [breast_cancer_data[j] for i, j in enumerate(random_order_2500) if i % 10 != mode] + \
+                     [diabetes_data[j] for i, j in enumerate(random_order_10000) if i % 10 != mode]
+
+        valid_data = [aids_data[j] for i, j in enumerate(random_order_2500) if i % 10 == mode] + \
+                     [hypertension_data[j] for i, j in enumerate(random_order_2500) if i % 10 == mode] + \
+                     [hepatitis_data[j] for i, j in enumerate(random_order_2500) if i % 10 == mode] + \
+                     [breast_cancer_data[j] for i, j in enumerate(random_order_2500) if i % 10 == mode] + \
+                     [diabetes_data[j] for i, j in enumerate(random_order_10000) if i % 10 == mode]
 
         _train_ds = DataGenerator(
             train_data,
