@@ -30,7 +30,7 @@ if not os.path.exists(MODEL_SAVED):
 
 mode = None
 np.random.seed(123)
-learning_rate = 5e-4
+learning_rate = 4e-4
 min_learning_rate = 1e-4
 binary_classifier_threshold = 0.5
 tokenize = jieba.cut
@@ -243,15 +243,14 @@ class DataGenerator:
 class CoAttentionAndCombine(Layer):
     def __init__(self, atype):
         super(CoAttentionAndCombine, self).__init__()
-        self.supports_masking = True
         self.atype = atype
 
     def build(self, input_shape):
         # Used purely for shape validation.
-        if len(input_shape) != 2:
+        if len(input_shape) != 4:
             raise ValueError(
                 'A `CoAttentionAndCombine` layer should be called '
-                'on a list of 2 inputs')
+                'on a list of 4 inputs')
         if all([shape is None for shape in input_shape]):
             return
         inputs_shapes = [list(shape)
@@ -265,7 +264,11 @@ class CoAttentionAndCombine(Layer):
 
     def call(self, inputs, **kwargs):
         x1 = inputs[0]
-        x2 = inputs[1]
+        m1 = tf.expand_dims(inputs[1], axis=2)  # (batch_size, seq_len1, 1)
+        x2 = inputs[2]
+        m2 = tf.expand_dims(inputs[3], axis=1)  # (batch_size, 1, seq_len2)
+        mask_similarity_matrix = tf.matmul(m1, m2)  # (batch_size, seq_len1, seq_len2)
+        mask_similarity_matrix = (mask_similarity_matrix - 1.) * 10000
         similarity_matrix: object = None
         if self.atype == 'dot':
             # (batch_size, seq_len1, seq_len2)
@@ -277,8 +280,8 @@ class CoAttentionAndCombine(Layer):
                         [2], [0]]), x2, transpose_b=True)
         assert similarity_matrix is not None, "type %s is not in ['dot', 'bi_linear']" % self.atype
 
-        similarity_matrix_transpose = tf.transpose(
-            similarity_matrix, perm=[0, 2, 1])
+        similarity_matrix = tf.add(similarity_matrix, mask_similarity_matrix)
+        similarity_matrix_transpose = tf.transpose(similarity_matrix, perm=[0, 2, 1])
 
         alpha1 = tf.nn.softmax(similarity_matrix_transpose, axis=-1)
         alpha2 = tf.nn.softmax(similarity_matrix, axis=-1)
@@ -295,7 +298,8 @@ class CoAttentionAndCombine(Layer):
 
     def compute_output_shape(self, input_shape: List[Tuple]) -> List[Tuple]:
         output_shapes: List[Tuple] = list()  # ***element must be a tuple***
-        for x in input_shape:
+        input_shapes = [input_shape[0], input_shape[2]]  # do not output mask
+        for x in input_shapes:
             output_shapes.append((x[0], x[1], 4 * x[2]))
         return output_shapes
 
@@ -313,47 +317,56 @@ def create_esim_model(atype='bi_linear') -> [Model, Model]:
     c_in = Input(shape=(None,))
     y_in = Input(shape=(None,))
 
+    mask1 = Lambda(lambda x: K.cast(K.greater(x, 0), 'float32'))(x1_in)
+    mask2 = Lambda(lambda x: K.cast(K.greater(x, 0), 'float32'))(x2_in)
+
     embed_layer = Embedding(input_dim=len(token_index), output_dim=200,
                             weights=[embedding],
-                            trainable=False,
-                            mask_zero=True)  # keras' mask mechanism is NIUBI,
+                            trainable=False)  # keras' mask mechanism is NIUBI,
     # the mask schema: if embedding's mask_zero is True, mask(input) ->
     # layer/model operation -> output
+    # ==> keras's mask is hard to support custom layer. so revise something
+
     x1_embed_dropout = Dropout(0.5)(embed_layer(x1_in))
     x2_embed_dropout = Dropout(0.5)(embed_layer(x2_in))
 
     input_encoder = Bidirectional(LSTM(units=200,
-                                       activation="relu",
                                        return_sequences=True,
-                                       recurrent_dropout=0.3,
-                                       dropout=0.3))
-    x1_bar = input_encoder(x1_embed_dropout)
+                                       recurrent_dropout=0.2,
+                                       dropout=0.2))
+    x1_bar = input_encoder(x1_embed_dropout, mask=mask1)
 
-    x2_bar = input_encoder(x2_embed_dropout)
+    x2_bar = input_encoder(x2_embed_dropout, mask=mask2)
 
     local_inference = CoAttentionAndCombine(atype=atype)
 
-    x1_combined, x2_combined = local_inference([x1_bar, x2_bar])
+    x1_combined, x2_combined = local_inference([x1_bar, mask1, x2_bar, mask2])
 
     inference_composition = Bidirectional(LSTM(units=200,
-                                               activation="relu",
                                                return_sequences=True,
-                                               recurrent_dropout=0.3,
-                                               dropout=0.3))
-    x1_compared = inference_composition(x1_combined)
-    x2_compared = inference_composition(x2_combined)
+                                               recurrent_dropout=0.2,
+                                               dropout=0.2))
+    x1_compared = inference_composition(x1_combined, mask=mask1)
+    x2_compared = inference_composition(x2_combined, mask=mask2)
 
-    def reduce_mean_closure(x):
-        return tf.reduce_mean(x, axis=1)
+    def reduce_mean_with_mask(x, mask):
+        dim = K.int_shape(x)[-1]
+        seq_len = K.expand_dims(K.sum(mask, 1), 1)  # (batch_size, 1)
+        seq_len_tiled = K.tile(seq_len, [1, dim])  # (batch_size, dim), unknown to the keras' broadcasting
+        x_sum = K.sum(x, axis=1)  # (batch_size, dim)
+        return x_sum / seq_len_tiled
 
-    def reduce_max_closure(x):
-        return tf.reduce_max(x, axis=1)
-    avg_op = Lambda(reduce_mean_closure)
-    max_op = Lambda(reduce_max_closure)
+    avg_mask1 = lambda x: reduce_mean_with_mask(x, mask1)
+    avg_mask2 = lambda x: reduce_mean_with_mask(x, mask2)
+    max_closure = lambda x: K.max(x, axis=1)
 
-    x1_avg = avg_op(x1_compared)
+    avg_op1 = Lambda(avg_mask1)
+    avg_op2 = Lambda(avg_mask2)
+    max_op = Lambda(max_closure)
+
+    x1_avg = avg_op1(x1_compared)
     x1_max = max_op(x1_compared)
-    x2_avg = avg_op(x2_compared)
+    x2_avg = avg_op2(x2_compared)
     x2_max = max_op(x2_compared)
 
     x1_rep = Concatenate()([x1_avg, x1_max])
@@ -376,7 +389,7 @@ def create_esim_model(atype='bi_linear') -> [Model, Model]:
 
 def train(train_model, train_ds, valid_ds, model_name):
     evaluator = Evaluator(model_name=model_name, valid_ds=valid_ds)
-    early_stopping = EarlyStopping(monitor='val_loss', patience=10, verbose=1)
+    early_stopping = EarlyStopping(monitor='val_loss', patience=20, verbose=1)
 
     train_model.fit_generator(train_ds.iterator(),
                               steps_per_epoch=len(train_ds),
