@@ -55,33 +55,38 @@ breast_cancer_data = []
 diabetes_data = []
 hepatitis_data = []
 hypertension_data = []
-for index, row in pd.read_csv(ROOT / "train.csv").iterrows():
+for index, row in pd.read_csv(ROOT / "train_id.csv").iterrows():
     if row["category"] == "aids":
         aids_data.append((row['question1'],
                           row['question2'],
                           row['category'],
-                          row['label']))
+                          row['label'],
+                          row['id']))
 
     elif row["category"] == "breast_cancer":
         breast_cancer_data.append((row['question1'],
                                    row['question2'],
                                    row['category'],
-                                   row['label']))
+                                   row['label'],
+                                   row['id']))
     elif row["category"] == "diabetes":
         diabetes_data.append((row['question1'],
                               row['question2'],
                               row['category'],
-                              row['label']))
+                              row['label'],
+                              row['id']))
     elif row["category"] == "hepatitis":
         hepatitis_data.append((row['question1'],
                                row['question2'],
                                row['category'],
-                               row['label']))
+                               row['label'],
+                               row['id']))
     elif row["category"] == "hypertension":
         hypertension_data.append((row['question1'],
                                   row['question2'],
                                   row['category'],
-                                  row['label']))
+                                  row['label'],
+                                  row['id']))
 
 test_data = []
 for index, row in pd.read_csv(ROOT / "dev_id.csv").iterrows():
@@ -159,9 +164,9 @@ class Evaluator(Callback):
                                      (str(mode), str(round(_val_f1, 4)))))
             self._best_f1 = _val_f1
 
-        if self.best_epoch - self.best_epoch > self.patience:
+        if self.epochs - self.best_epoch > self.patience:
             self.model.stop_training = True
-            logger.info("%d epochs have no improvement, earlystoping cased..." % self.patience)
+            logger.info("%d epochs have no improvement, earlystoping caused..." % self.patience)
         self.epochs += 1
 
 
@@ -180,6 +185,7 @@ class DataGenerator:
                 self.idxs = random_order_2000
             elif len(self.data) == 18000:
                 self.idxs = random_order_18000
+            self.ID = self._get_all_id_as_ndarray()[self.idxs]
             self.all_labels = self._get_all_label_as_ndarray()
             self.all_labels = self.all_labels[self.idxs]
         else:
@@ -229,12 +235,10 @@ class DataGenerator:
             return None
         all_labels = []
         for x in self.data:
-            all_labels.append(x[-1])
+            all_labels.append(x[-2])
         return np.array(all_labels, dtype=np.float32)
 
     def _get_all_id_as_ndarray(self):
-        if not self.test:
-            return None
         all_ids = []
         for x in self.data:
             all_ids.append(x[-1])
@@ -312,11 +316,11 @@ def create_bert_concat_category_embedding_model():
 
 def train(train_model, train_ds, valid_ds, model_name):
 
-    evaluator = Evaluator(model_name=model_name, valid_ds=valid_ds, patience=10)
+    evaluator = Evaluator(model_name=model_name, valid_ds=valid_ds, patience=5)
 
     train_model.fit_generator(train_ds.iterator(),
                               steps_per_epoch=len(train_ds),
-                              epochs=100,
+                              epochs=30,
                               validation_data=valid_ds.iterator(),
                               validation_steps=len(valid_ds),
                               callbacks=[evaluator])
@@ -352,6 +356,7 @@ def predict(model, weights_path, test_ds):
 def gen_stacking_features(weights_root_path, model_name):
     valid_true_labels = []
     valid_probs = []
+    valid_ids = []
     mode_test_ds = DataGenerator(test_data, batch_size=32, test=True)
     test_ids = mode_test_ds.ID
     test_probs = []
@@ -368,6 +373,7 @@ def gen_stacking_features(weights_root_path, model_name):
 
         mode_valid_ds = DataGenerator(_valid_data, batch_size=32, test=False)
         valid_true_labels.append(mode_valid_ds.all_labels)
+        valid_ids.append(mode_valid_ds.ID)
 
         valid_probs.append(
             np.squeeze(
@@ -393,8 +399,10 @@ def gen_stacking_features(weights_root_path, model_name):
         to_vote_format["label_%s" % str(i)] = np.array(each.round(), np.int32)
     pd.DataFrame(to_vote_format).to_csv(ROOT / (model_name + "_predictions_for_vote.csv"), index=False)
 
-    valid_out = pd.DataFrame({"probs": np.concatenate(
-        valid_probs), "label": np.array(np.concatenate(valid_true_labels), np.int32)})
+    valid_out = pd.DataFrame({"id": np.concatenate(valid_ids).astype(np.int32),
+                              "probs": np.concatenate(valid_probs),
+                              "label": np.concatenate(valid_true_labels).astype(np.int32)})
+    valid_out.sort_values(by='id', inplace=True)
 
     test_out = pd.DataFrame(
         {"id": test_ids, "probs": np.mean(test_probs, axis=0)})
@@ -406,7 +414,6 @@ def gen_stacking_features(weights_root_path, model_name):
 
 
 if __name__ == "__main__":
-    # 按照9:1的比例划分训练集和验证集
 
     for mode in range(10):
         train_data = [aids_data[j] for i, j in enumerate(random_order_2500) if i % 10 != mode] + \

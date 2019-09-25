@@ -3,7 +3,7 @@ import numpy as np
 from pathlib import Path
 import os
 
-from keras.layers import Dense, Input
+from keras.layers import Dense, Input, Embedding, Lambda, Concatenate
 from keras.models import Model
 from keras.callbacks import Callback
 import keras.backend as K
@@ -16,23 +16,47 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 latent_dim = 8
+embed_dim = 5
 mode = None
 binary_classifier_threshold = 0.5
 np.random.seed(123)
 ROOT = Path("./data")
 OUTPUT = Path("./output")
 MODEL_SAVED = Path("./model_saved")
+categories = ["aids", "breast_cancer", "diabetes", "hepatitis", "hypertension"]
 
+
+train_features_labels = list()
+train_features_labels.append(pd.read_csv(ROOT / "base_bert_stacking_new_train.csv"))
+train_features_labels.append(pd.read_csv(ROOT / "base_esim_stacking_new_train.csv"))
+result = train_features_labels[0]
+for i in range(1, len(train_features_labels)):
+    result = pd.merge(left=result, right=train_features_labels[i], on=["id", "label"])
+category = pd.read_csv(ROOT / "train_id.csv")[['id', 'category']]
+result = pd.merge(left=result, right=category, on=['id'])
 
 data = []
-for index, row in pd.read_csv(
-        ROOT / "base_bert_stacking_new_train.csv").iterrows():
-    data.append((row["probs"], row["label"]))
+for index, row in result.iterrows():
+    data.append(([row["probs_x"], row["probs_y"]],
+                 categories.index(row["category"]),
+                 row["label"],
+                 row["id"]))
+
+
+test_features = list()
+test_features.append(pd.read_csv(ROOT / "base_bert_stacking_new_test.csv"))
+test_features.append(pd.read_csv(ROOT / "base_esim_stacking_new_test.csv"))
+test_result = test_features[0]
+for i in range(1, len(test_features)):
+    test_result = pd.merge(left=test_result, right=test_features[i], on=["id"])
+test_category = pd.read_csv(ROOT / "dev_id.csv")[['id', 'category']]
+test_result = pd.merge(left=test_result, right=test_category, on=['id'])
 
 test_data = []
-for index, row in pd.read_csv(
-        ROOT / "base_bert_stacking_new_test.csv").iterrows():
-    test_data.append((row["probs"], row["id"]))
+for index, row in test_result.iterrows():
+    test_data.append(([row["probs_x"], row["probs_y"]],
+                      categories.index(row["category"]),
+                      row["id"]))
 
 
 class DataGenerator:
@@ -47,6 +71,7 @@ class DataGenerator:
             logger.info("__Shuffle the dataset__")
             self.idxs = [x for x in range(len(self.data))]
             np.random.shuffle(self.idxs)
+            self.ID = self._get_all_id_as_ndarray()[self.idxs]
             self.all_labels = self._get_all_label_as_ndarray()
             self.all_labels = self.all_labels[self.idxs]
         else:
@@ -60,12 +85,10 @@ class DataGenerator:
             return None
         all_labels = []
         for x in self.data:
-            all_labels.append(x[-1])
+            all_labels.append(x[-2])
         return np.array(all_labels, dtype=np.float32)
 
     def _get_all_id_as_ndarray(self):
-        if not self.test:
-            return None
         all_ids = []
         for x in self.data:
             all_ids.append(x[-1])
@@ -74,33 +97,37 @@ class DataGenerator:
     def iterator(self):
         while True:
             if not self.test:
-                X, Y = [], []
+                X, C, Y = [], [], []
                 for i in self.idxs:
                     d = self.data[i]
-                    x, y = d[0], d[1]  # x can be a list/ndarray
+                    x, c, y = d[0], d[1], d[2]  # x can be a list/ndarray
 
-                    X.append([x])
+                    X.append(x)
+                    C.append([c])
                     Y.append([y])
                     if len(X) == self.batch_size or i == self.idxs[-1]:
-                        yield np.array(X, np.float32), np.array(Y, np.float32)
-                        X, Y = [], []
+                        yield [np.array(X, np.float32), np.array(C, np.int32)], np.array(Y, np.float32)
+                        X, C, Y = [], [], []
             else:
-                X, Y = [], []
+                X, C = [], []
                 for i in range(len(self.data)):
                     d = self.data[i]
-                    x, y = d[0], d[1]  # x can be a list/ndarray
-
-                    X.append([x])
-                    Y.append([y])
+                    x, c = d[0], d[1]  # x can be a list/ndarray
+                    X.append(x)
+                    C.append([c])
                     if len(X) == self.batch_size or i == len(self.data) - 1:
-                        yield np.array(X, np.float32), None
-                        X, Y = [], []
+                        yield [np.array(X, np.float32), np.array(C, np.int32)], None
+                        X, C = [], []
 
 
 class Evaluator(Callback):
-    def __init__(self, model_name, valid_ds):
+    def __init__(self, model_name, valid_ds, patience):
         super(Evaluator, self).__init__()
         self._best_f1 = 0.
+        self.passed = 0
+        self.best_epoch = -1
+        self.epochs = 0
+        self.patience = patience
         self._model_saved = MODEL_SAVED / model_name
         self.valid_ds = valid_ds
         if not os.path.exists(self._model_saved):
@@ -127,7 +154,8 @@ class Evaluator(Callback):
               "\t-val_p_measure: ", round(_val_precision, 4),
               "\t-val_r_measure: ", round(_val_recall, 4))
         if _val_f1 > self._best_f1:
-
+            self.best_epoch = self.epochs
+            assert isinstance(mode, int), "check mode, must be a integer"
             file_names = os.listdir(self._model_saved)
             for fn in file_names:
                 if "mode_%s" % str(mode) in fn:
@@ -147,6 +175,11 @@ class Evaluator(Callback):
                                      (str(mode), str(round(_val_f1, 4)))))
             self._best_f1 = _val_f1
 
+        if self.epochs - self.best_epoch > self.patience:
+            self.model.stop_training = True
+            logger.info("%d epochs have no improvement, earlystoping caused..." % self.patience)
+        self.epochs += 1
+
 
 def create_lr_model():
     x_in = Input(shape=(None,))
@@ -160,10 +193,21 @@ def create_lr_model():
 
 
 def create_mlp_model():
-    x_in = Input(shape=(1,))
+    x_in = Input(shape=(2,))
+    c_in = Input(shape=(1,))
+
+    c_embedding = Embedding(input_dim=len(categories),
+                            output_dim=embed_dim,
+                            trainable=True)
+
     x_act = Dense(units=latent_dim, activation='relu')(x_in)
-    p = Dense(units=1, activation='sigmoid')(x_act)
-    model = Model(x_in, p)
+    c_embed = c_embedding(c_in)  # (B, 1, D)
+    c_feat = Lambda(lambda x: K.squeeze(x, axis=1))(c_embed)
+
+    merge_feat = Concatenate(axis=-1)([x_act, c_feat])
+
+    p = Dense(units=1, activation='sigmoid')(merge_feat)
+    model = Model([x_in, c_in], p)
     model.compile(loss='binary_crossentropy',
                   optimizer='sgd',
                   metrics=['accuracy'])
@@ -220,15 +264,15 @@ if __name__ == "__main__":
         _test_ds = DataGenerator(test_data, test=True)
 
         _model = create_mlp_model()
-        evaluator = Evaluator("base_bert_stacking_mlp", _valid_ds)
+        evaluator = Evaluator("esim_bert_stacking_mlp", _valid_ds, patience=10)
         _model.fit_generator(_train_ds.iterator(),
                              steps_per_epoch=len(_train_ds),
-                             epochs=20,
+                             epochs=50,
                              validation_data=_valid_ds.iterator(),
                              validation_steps=len(_valid_ds),
                              callbacks=[evaluator])
         K.clear_session()
 
     stacking(
-        MODEL_SAVED / "base_bert_stacking_mlp",
-        "ensemble_10_fold_valid_by_mlp.csv")
+        MODEL_SAVED / "esim_bert_stacking_mlp",
+        "ensemble_esim_bert_by_mlp_stacking.csv")
