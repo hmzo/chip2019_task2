@@ -42,6 +42,7 @@ binary_classifier_threshold = 0.5
 tokenize = jieba.cut
 # tokenize = pkuseg.pkuseg(model_name='medicine').cut
 # tokenize = thulac.thulac().cut
+# tokenize = lambda x: [c for c in x]
 
 categories = ["aids", "breast_cancer", "diabetes", "hepatitis", "hypertension"]
 
@@ -52,8 +53,8 @@ diabetes_data = []
 hepatitis_data = []
 hypertension_data = []
 for index, row in pd.read_csv(ROOT / "train_id.csv").iterrows():
-    tokenized_q1 = [x[0] for x in tokenize(row['question1'])]
-    tokenized_q2 = [x[0] for x in tokenize(row['question2'])]
+    tokenized_q1 = [x for x in tokenize(row['question1'])]
+    tokenized_q2 = [x for x in tokenize(row['question2'])]
     if row["category"] == "aids":
         aids_data.append((tokenized_q1,
                           tokenized_q2,
@@ -189,9 +190,16 @@ class Evaluator(Callback):
                                      (str(mode), str(round(_val_f1, 4)))))
             self._best_f1 = _val_f1
 
+        # 超过二分之一个patience没有提高，则提高pos_weight
+        if self.epochs - self.best_epoch > self.patience // 2 and isinstance(pos_weight, tf.Tensor):
+            new_pos_weight = max(0.1, min((self.epochs - self.best_epoch) * 0.1, max_pos_weight))
+            K.set_value(pos_weight, new_pos_weight)
+            logger.info("Set the pos_weight to %s" % str(new_pos_weight))
+
         if self.epochs - self.best_epoch > self.patience:
             self.model.stop_training = True
             logger.info("%d epochs have no improvement, earlystoping caused..." % self.patience)
+
         self.epochs += 1
 
 
@@ -348,7 +356,7 @@ def seq_padding(seqs, padding=0):
                      if len(x) < max_len else x for x in seqs])
 
 
-def create_esim_model(atype='bi_linear') -> [Model, Model]:
+def create_esim_model(atype='dot') -> [Model, Model]:
     x1_in = Input(shape=(None,))
     x2_in = Input(shape=(None,))
     c_in = Input(shape=(None,))
@@ -415,12 +423,15 @@ def create_esim_model(atype='bi_linear') -> [Model, Model]:
 
     merge_features = Concatenate()([x1_rep, x2_rep])
     hidden = Dropout(0.5)(Dense(200, activation='relu')(merge_features))
-    p = Dense(1, activation='sigmoid')(hidden)
+    logits = Dense(1, activation=None)(hidden)
+    p = Lambda(lambda x: K.sigmoid(x))(logits)
 
     train_model = Model([x1_in, x2_in, c_in, y_in], p)
     model = Model([x1_in, x2_in, c_in], p)
 
-    loss = K.mean(K.binary_crossentropy(target=y_in, output=p))
+    # 训练中发现recall高的离谱，所以调整正样本损失权重
+    loss = K.mean(tf.nn.weighted_cross_entropy_with_logits(targets=y_in, logits=logits, pos_weight=pos_weight))
+
     train_model.add_loss(loss)
 
     train_model.compile(optimizer=Adam(learning_rate))
@@ -537,6 +548,17 @@ def gen_stacking_features(weights_root_path, model_name):
 if __name__ == "__main__":
 
     for mode in range(10):
+
+        config = tf.ConfigProto()
+        config.gpu_options.allow_growth = True
+        sess = tf.Session(config=config)
+        K.set_session(sess)
+
+        max_pos_weight = 1
+        # pos_weight = 0.1
+        # 可变pos_weight版本loss，后期因为pos_weight过小可能会导致训练过慢,可以适当放宽对recall的限制
+        pos_weight = K.variable(0.1, dtype="float32", name="pos_weight")
+
         train_data = [aids_data[j] for i, j in enumerate(random_order_2500) if i % 10 != mode] + \
                      [hypertension_data[j] for i, j in enumerate(random_order_2500) if i % 10 != mode] +\
                      [hepatitis_data[j] for i, j in enumerate(random_order_2500) if i % 10 != mode] + \
@@ -569,7 +591,7 @@ if __name__ == "__main__":
             train_model=_train_model,
             train_ds=_train_ds,
             valid_ds=_valid_ds,
-            model_name="base_esim")
+            model_name="base_esim_w2v_trainable_dot")
         logger.info("___Reset The Computing Graph___")
         K.clear_session()
-    gen_stacking_features(Path(MODEL_SAVED) / "base_esim", "base_esim")
+    gen_stacking_features(Path(MODEL_SAVED) / "base_esim_w2v_trainable_dot", "base_esim_w2v_trainable_dot")

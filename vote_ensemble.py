@@ -21,4 +21,4 @@ for _, row in all_test_pred.iterrows():
         preds.append(0)
 
 pd.DataFrame({"id": np.array(ids, np.int32), "label": np.array(preds, np.int32)}).to_csv(
-    "./output/ensemble_10_fold_valid_by_vote.csv", index=False)
+    "./output/ensemble_base_bert_by_vote.csv", index=False)

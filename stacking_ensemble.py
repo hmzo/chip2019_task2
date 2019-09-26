@@ -9,43 +9,81 @@ from keras.callbacks import Callback
 import keras.backend as K
 
 from sklearn.metrics import f1_score, precision_score, recall_score
+from sklearn.linear_model import LogisticRegression
 
 import logging
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-latent_dim = 8
+latent_dim = 10
 embed_dim = 5
 mode = None
 binary_classifier_threshold = 0.5
-np.random.seed(123)
 ROOT = Path("./data")
 OUTPUT = Path("./output")
 MODEL_SAVED = Path("./model_saved")
 categories = ["aids", "breast_cancer", "diabetes", "hepatitis", "hypertension"]
 
+random_order_2000 = np.fromfile("./random_order_2000.npy", dtype=np.int32)
+random_order_10000 = np.fromfile("./random_order_10000.npy", dtype=np.int32)
+random_order_2500 = np.fromfile("./random_order_2500.npy", dtype=np.int32)
+random_order_18000 = np.fromfile("./random_order_18000.npy", dtype=np.int32)
+
 
 train_features_labels = list()
-train_features_labels.append(pd.read_csv(ROOT / "base_bert_stacking_new_train.csv"))
-train_features_labels.append(pd.read_csv(ROOT / "base_esim_stacking_new_train.csv"))
+train_features_labels.append(pd.read_csv(
+    ROOT / "base_bert_stacking_new_train.csv"))
+# train_features_labels.append(pd.read_csv(
+#     ROOT / "base_esim_stacking_new_train.csv"))
 result = train_features_labels[0]
 for i in range(1, len(train_features_labels)):
-    result = pd.merge(left=result, right=train_features_labels[i], on=["id", "label"])
+    result = pd.merge(
+        left=result, right=train_features_labels[i], on=[
+            "id", "label"])
 category = pd.read_csv(ROOT / "train_id.csv")[['id', 'category']]
 result = pd.merge(left=result, right=category, on=['id'])
 
-data = []
+aids_data = []
+breast_cancer_data = []
+diabetes_data = []
+hepatitis_data = []
+hypertension_data = []
+probs = set([k if ("probs" in k) else None for k in result.keys()])
+probs.remove(None)
+probs = [x for x in probs]
+
 for index, row in result.iterrows():
-    data.append(([row["probs_x"], row["probs_y"]],
-                 categories.index(row["category"]),
-                 row["label"],
-                 row["id"]))
+    if row["category"] == "aids":
+        aids_data.append(([row[key] for key in probs],
+                          categories.index(row["category"]),
+                          row["label"],
+                          row["id"]))
+    elif row["category"] == "breast_cancer":
+        breast_cancer_data.append(([row[key] for key in probs],
+                                   categories.index(row["category"]),
+                                   row["label"],
+                                   row["id"]))
+    elif row["category"] == "diabetes":
+        diabetes_data.append(([row[key] for key in probs],
+                              categories.index(row["category"]),
+                              row["label"],
+                              row["id"]))
+    elif row["category"] == "hepatitis":
+        hepatitis_data.append(([row[key] for key in probs],
+                               categories.index(row["category"]),
+                               row["label"],
+                               row["id"]))
+    elif row["category"] == "hypertension":
+        hypertension_data.append(([row[key] for key in probs],
+                                  categories.index(row["category"]),
+                                  row["label"],
+                                  row["id"]))
 
 
 test_features = list()
 test_features.append(pd.read_csv(ROOT / "base_bert_stacking_new_test.csv"))
-test_features.append(pd.read_csv(ROOT / "base_esim_stacking_new_test.csv"))
+# test_features.append(pd.read_csv(ROOT / "base_esim_stacking_new_test.csv"))
 test_result = test_features[0]
 for i in range(1, len(test_features)):
     test_result = pd.merge(left=test_result, right=test_features[i], on=["id"])
@@ -54,7 +92,7 @@ test_result = pd.merge(left=test_result, right=test_category, on=['id'])
 
 test_data = []
 for index, row in test_result.iterrows():
-    test_data.append(([row["probs_x"], row["probs_y"]],
+    test_data.append(([row[key] for key in probs],
                       categories.index(row["category"]),
                       row["id"]))
 
@@ -69,8 +107,10 @@ class DataGenerator:
         self.test = test
         if not test:
             logger.info("__Shuffle the dataset__")
-            self.idxs = [x for x in range(len(self.data))]
-            np.random.shuffle(self.idxs)
+            if len(self.data) == 2000:
+                self.idxs = random_order_2000
+            elif len(self.data) == 18000:
+                self.idxs = random_order_18000
             self.ID = self._get_all_id_as_ndarray()[self.idxs]
             self.all_labels = self._get_all_label_as_ndarray()
             self.all_labels = self.all_labels[self.idxs]
@@ -177,14 +217,17 @@ class Evaluator(Callback):
 
         if self.epochs - self.best_epoch > self.patience:
             self.model.stop_training = True
-            logger.info("%d epochs have no improvement, earlystoping caused..." % self.patience)
+            logger.info(
+                "%d epochs have no improvement, earlystoping caused..." %
+                self.patience)
         self.epochs += 1
 
 
 def create_lr_model():
-    x_in = Input(shape=(None,))
+    x_in = Input(shape=(2,))
+    c_in = Input(shape=(1,))
     p = Dense(units=1, activation='sigmoid')(x_in)
-    model = Model(x_in, p)
+    model = Model([x_in, c_in], p)
     model.compile(loss='binary_crossentropy',
                   optimizer='adam',
                   metrics=['accuracy'])
@@ -193,7 +236,7 @@ def create_lr_model():
 
 
 def create_mlp_model():
-    x_in = Input(shape=(2,))
+    x_in = Input(shape=(1,))
     c_in = Input(shape=(1,))
 
     c_embedding = Embedding(input_dim=len(categories),
@@ -220,7 +263,7 @@ def stacking(weights_root_path, output_name):
     test_ids = mode_test_ds.ID
     test_probs = []
     for weight in os.listdir(weights_root_path):
-        model = create_mlp_model()  # todo: be easy to modify it
+        model = create_lr_model()  # todo: be easy to modify it
         model.load_weights(weights_root_path / weight)
         test_probs.append(
             np.squeeze(
@@ -246,33 +289,43 @@ def stacking(weights_root_path, output_name):
 
 
 if __name__ == "__main__":
-    random_order = [x for x in range(len(data))]
-    np.random.shuffle(random_order)
 
-    for mode in range(10):
-        train_data = [
-            data[j] for i,
-            j in enumerate(random_order) if i %
-            10 != mode]
-        valid_data = [
-            data[j] for i,
-            j in enumerate(random_order) if i %
-            10 == mode]
+    # for mode in range(10):
+    #     train_data = [aids_data[j] for i, j in enumerate(random_order_2500) if i % 10 != mode] + \
+    #                  [hypertension_data[j] for i, j in enumerate(random_order_2500) if i % 10 != mode] + \
+    #                  [hepatitis_data[j] for i, j in enumerate(random_order_2500) if i % 10 != mode] + \
+    #                  [breast_cancer_data[j] for i, j in enumerate(random_order_2500) if i % 10 != mode] + \
+    #                  [diabetes_data[j] for i, j in enumerate(random_order_10000) if i % 10 != mode]
+    #
+    #     valid_data = [aids_data[j] for i, j in enumerate(random_order_2500) if i % 10 == mode] + \
+    #                  [hypertension_data[j] for i, j in enumerate(random_order_2500) if i % 10 == mode] + \
+    #                  [hepatitis_data[j] for i, j in enumerate(random_order_2500) if i % 10 == mode] + \
+    #                  [breast_cancer_data[j] for i, j in enumerate(random_order_2500) if i % 10 == mode] + \
+    #                  [diabetes_data[j] for i, j in enumerate(random_order_10000) if i % 10 == mode]
+    #
+    #     _train_ds = DataGenerator(train_data)
+    #     _valid_ds = DataGenerator(valid_data)
+    #     _test_ds = DataGenerator(test_data, test=True)
+    #
+    #     _model = create_lr_model()
+    #     evaluator = Evaluator("esim_bert_stacking_lr", _valid_ds, patience=10)
+    #     _model.fit_generator(_train_ds.iterator(),
+    #                          steps_per_epoch=len(_train_ds),
+    #                          epochs=50,
+    #                          validation_data=_valid_ds.iterator(),
+    #                          validation_steps=len(_valid_ds),
+    #                          callbacks=[evaluator])
+    #     K.clear_session()
+    #
+    # stacking(
+    #     MODEL_SAVED / "esim_bert_stacking_lr",
+    #     "ensemble_esim_bert_by_lr_stacking.csv")
 
-        _train_ds = DataGenerator(train_data)
-        _valid_ds = DataGenerator(valid_data)
-        _test_ds = DataGenerator(test_data, test=True)
-
-        _model = create_mlp_model()
-        evaluator = Evaluator("esim_bert_stacking_mlp", _valid_ds, patience=10)
-        _model.fit_generator(_train_ds.iterator(),
-                             steps_per_epoch=len(_train_ds),
-                             epochs=50,
-                             validation_data=_valid_ds.iterator(),
-                             validation_steps=len(_valid_ds),
-                             callbacks=[evaluator])
-        K.clear_session()
-
-    stacking(
-        MODEL_SAVED / "esim_bert_stacking_mlp",
-        "ensemble_esim_bert_by_mlp_stacking.csv")
+    # 提交发现sklearn自带的逻辑回归效果很好，比keras写的lr高0.4个百分点左右
+    # =================== Using Sklearn-api =======================
+    X_train, y_train = result[probs].values, result["label"].values
+    stacker = LogisticRegression()
+    stacker.fit(X_train, y_train)
+    X_test = test_result[probs].values
+    output = pd.DataFrame({"id": test_result["id"], "label": stacker.predict(X_test).astype(np.int32)})
+    output.to_csv(OUTPUT / "ensemble_base_bert_by_sklearn_lr_stacking.csv", index=False)
