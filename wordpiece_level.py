@@ -26,7 +26,7 @@ if not os.path.exists(MODEL_SAVED):
 
 mode = None
 max_seq_len = 512
-learning_rate = 5e-5
+learning_rate = 7e-5
 min_learning_rate = 1e-5
 binary_classifier_threshold = 0.5
 config_path = './bert/bert_config.json'
@@ -464,7 +464,11 @@ if __name__ == "__main__":
                      [breast_cancer_data[j] for i, j in enumerate(random_order_2500) if i % 10 == mode] + \
                      [diabetes_data[j] for i, j in enumerate(random_order_10000) if i % 10 == mode]
 
-        # train_data = train_data + new_data
+        inverse_train_data = []
+        for x in train_data:
+            inverse_train_data.append((x[1], x[0], x[2], x[3], x[4]))
+
+        train_data = train_data + new_data
         _train_ds = DataGenerator(train_data, batch_size=32, test=False)
 
         _valid_ds = DataGenerator(valid_data, batch_size=32, test=False)
@@ -477,10 +481,10 @@ if __name__ == "__main__":
             train_model=_train_model,
             train_ds=_train_ds,
             valid_ds=_valid_ds,
-            model_name="base_bert_add_category")
+            model_name="base_bert_add_category_transfer_1")
         logger.info("___Reset The Computing Graph___")
         K.clear_session()
-    gen_stacking_features(Path(MODEL_SAVED) / "base_bert_add_category", "base_bert_add_category")
+    gen_stacking_features(Path(MODEL_SAVED) / "base_bert_add_category_transfer_1", "base_bert_add_category_transfer_1")
 
     # _, model = create_base_bert_model()
     # test_ds = DataGenerator(test_data, test=True)
