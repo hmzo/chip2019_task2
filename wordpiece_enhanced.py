@@ -9,8 +9,9 @@ from typing import Tuple, List
 import tensorflow as tf
 import keras.backend as K
 from sklearn.metrics import f1_score, precision_score, recall_score
-from keras.layers import Input, Embedding, Lambda, Dense, Layer, Concatenate, Dropout
+from keras.layers import Input, Embedding, Lambda, Dense, Layer, Concatenate, Dropout, Bidirectional, LSTM
 from keras.models import Model
+from keras.optimizers import Adam
 from keras.callbacks import Callback
 from keras_bert import load_trained_model_from_checkpoint, Tokenizer, AdamWarmup
 
@@ -25,7 +26,7 @@ if not os.path.exists(MODEL_SAVED):
 
 mode = None
 max_seq_len = 512
-learning_rate = 3e-5
+learning_rate = 5e-5
 min_learning_rate = 1e-5
 binary_classifier_threshold = 0.5
 config_path = './bert/bert_config.json'
@@ -107,6 +108,7 @@ class Evaluator(Callback):
     def __init__(self, model_name, valid_ds, patience):
         super(Evaluator, self).__init__()
         self._best_f1 = 0.
+        self._best_loss = 10000.
         self.passed = 0
         self.best_epoch = -1
         self.epochs = 0
@@ -115,6 +117,18 @@ class Evaluator(Callback):
         self.valid_ds = valid_ds
         if not os.path.exists(self._model_saved):
             os.makedirs(self._model_saved)
+
+    def on_batch_begin(self, epoch, logs=None):
+        if self.passed < self.params['steps']:
+            lr = (self.passed + 1.) / self.params['steps'] * learning_rate
+            K.set_value(self.model.optimizer.lr, lr)
+            self.passed += 1
+        elif self.params['steps'] <= self.passed < self.params['steps'] * 2:
+            lr = (2 - (self.passed + 1.) /
+                  self.params['steps']) * (learning_rate - min_learning_rate)
+            lr += min_learning_rate
+            K.set_value(self.model.optimizer.lr, lr)
+            self.passed += 1
 
     def on_epoch_end(self, epoch, logs=None):
         val_predict = (
@@ -136,7 +150,7 @@ class Evaluator(Callback):
         print("-val_f1_measure: ", round(_val_f1, 4),
               "\t-val_p_measure: ", round(_val_precision, 4),
               "\t-val_r_measure: ", round(_val_recall, 4))
-        if _val_f1 > self._best_f1:
+        if _val_f1 > self._best_f1 and logs.get("val_loss") < 0.5:
             self.best_epoch = self.epochs
             assert isinstance(mode, int), "check mode, must be a integer"
             file_names = os.listdir(self._model_saved)
@@ -149,14 +163,13 @@ class Evaluator(Callback):
 
             logger.info(
                 "Write %s into %s" %
-                ("mode_%s_F1_%s.weights" %
-                 (str(mode), str(
-                     round(
-                         _val_f1, 4))), self._model_saved))
+                ("mode_%s_F1_%s_loss_%s.weights" %
+                 (str(mode), str(round(_val_f1, 4)), str(round(logs.get("val_loss"), 4))), self._model_saved))
             self.model.save_weights(self._model_saved /
-                                    ("mode_%s_F1_%s.weights" %
-                                     (str(mode), str(round(_val_f1, 4)))))
+                                    ("mode_%s_F1_%s_loss_%s.weights" %
+                                     (str(mode), str(round(_val_f1, 4)), str(round(logs.get("val_loss"), 4)))))
             self._best_f1 = _val_f1
+            self._best_loss = logs.get("val_loss")
 
         if self.epochs - self.best_epoch > self.patience:
             self.model.stop_training = True
@@ -365,6 +378,13 @@ def create_bert_esim_model():
     q2 = Lambda(lambda x: x * K.expand_dims(mask2, axis=-1))(x)
     q1_combined, q2_combined = CoAttentionAndCombine('dot')([q1, mask1, q2, mask2])
 
+    # inference_composition = Bidirectional(LSTM(units=200,
+    #                                            return_sequences=True,
+    #                                            recurrent_dropout=0.2,
+    #                                            dropout=0.2))
+    # q1_compared = inference_composition(q1_combined, mask=mask1)
+    # q2_compared = inference_composition(q2_combined, mask=mask2)
+
     def reduce_mean_with_mask(x, mask):
         dim = K.int_shape(x)[-1]
         seq_len = K.expand_dims(K.sum(mask, 1), 1)  # (batch_size, 1)
@@ -402,10 +422,7 @@ def create_bert_esim_model():
     loss = K.mean(K.binary_crossentropy(target=y_in, output=p))
     train_model.add_loss(loss)
 
-    train_model.compile(optimizer=AdamWarmup(decay_steps=len(_train_ds),
-                                             warmup_steps=len(_train_ds),
-                                             lr=learning_rate,
-                                             min_lr=min_learning_rate))
+    train_model.compile(optimizer=Adam(learning_rate))
     train_model.summary()
 
     return train_model, model
@@ -428,7 +445,7 @@ def gen_stacking_features(weights_root_path, model_name):
     valid_true_labels = []
     valid_probs = []
     valid_ids = []
-    mode_test_ds = DataGenerator(test_data, batch_size=32, test=True)
+    mode_test_ds = DataGenerator(test_data, batch_size=16, test=True)
     test_ids = mode_test_ds.ID
     test_probs = []
     for weight in os.listdir(weights_root_path):
@@ -442,7 +459,7 @@ def gen_stacking_features(weights_root_path, model_name):
                       [breast_cancer_data[j] for i, j in enumerate(random_order_2500) if i % 10 == _mode] + \
                       [diabetes_data[j] for i, j in enumerate(random_order_10000) if i % 10 == _mode]
 
-        mode_valid_ds = DataGenerator(_valid_data, batch_size=32, test=False)
+        mode_valid_ds = DataGenerator(_valid_data, batch_size=16, test=False)
         valid_true_labels.append(mode_valid_ds.all_labels)
         valid_ids.append(mode_valid_ds.ID)
 
@@ -484,6 +501,23 @@ def gen_stacking_features(weights_root_path, model_name):
         ROOT / (model_name + "_stacking_new_test.csv"), index=False)
 
 
+def get_loss(weights_path: str):
+    _mode = int(weights_path.split('/')[-1].split('_')[1])
+    _valid_data = [aids_data[j] for i, j in enumerate(random_order_2500) if i % 10 == _mode] + \
+                  [hypertension_data[j] for i, j in enumerate(random_order_2500) if i % 10 == _mode] + \
+                  [hepatitis_data[j] for i, j in enumerate(random_order_2500) if i % 10 == _mode] + \
+                  [breast_cancer_data[j] for i, j in enumerate(random_order_2500) if i % 10 == _mode] + \
+                  [diabetes_data[j] for i, j in enumerate(random_order_10000) if i % 10 == _mode]
+    ds = DataGenerator(_valid_data, batch_size=32, test=False)
+    tm, m = create_bert_esim_model()
+
+    tm.load_weights(weights_path)
+    tm.compile(optimizer=Adam())
+    loss = tm.evaluate_generator(generator=ds.iterator(), steps=len(ds))
+    K.clear_session()
+    return loss
+
+
 if __name__ == "__main__":
     for mode in range(10):
         train_data = [aids_data[j] for i, j in enumerate(random_order_2500) if i % 10 != mode] + \
@@ -499,11 +533,11 @@ if __name__ == "__main__":
                      [diabetes_data[j] for i, j in enumerate(random_order_10000) if i % 10 == mode]
 
         # train_data = train_data + new_data
-        _train_ds = DataGenerator(train_data, batch_size=32, test=False)
+        _train_ds = DataGenerator(train_data, batch_size=16, test=False)
 
-        _valid_ds = DataGenerator(valid_data, batch_size=32, test=False)
+        _valid_ds = DataGenerator(valid_data, batch_size=16, test=False)
 
-        _test_ds = DataGenerator(test_data, batch_size=32, test=True)
+        _test_ds = DataGenerator(test_data, batch_size=16, test=True)
 
         _train_model, _model = create_bert_esim_model()  # todo: be easy to modify it
 
@@ -511,8 +545,15 @@ if __name__ == "__main__":
             train_model=_train_model,
             train_ds=_train_ds,
             valid_ds=_valid_ds,
-            model_name="esim_bert")
+            model_name="esim_lstm_bert")
         logger.info("___Reset The Computing Graph___")
         K.clear_session()
-    gen_stacking_features(Path(MODEL_SAVED) / "esim_bert", "esim_bert")
+    gen_stacking_features(Path(MODEL_SAVED) / "esim_lstm_bert", "esim_lstm_bert")
+
+    # wdir = './model_saved/esim_bert/'
+    # for old_name in os.listdir(wdir):
+    #     if 'loss' not in old_name.split('_'):
+    #         loss = get_loss(wdir + old_name)
+    #         new_name = old_name[:-8] + '_loss_%s.weights' % str(round(loss, 4))
+    #         os.renames(wdir + old_name, wdir + new_name)
 
