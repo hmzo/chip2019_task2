@@ -428,6 +428,77 @@ def create_bert_esim_model():
     return train_model, model
 
 
+def create_bert_esim_add_category_model():
+    bert_model = load_trained_model_from_checkpoint(
+        config_path, checkpoint_path, seq_len=None)
+    for l in bert_model.layers:
+        l.trainable = True
+
+    x1_in = Input(shape=(None,))
+    x2_in = Input(shape=(None,))
+    c_in = Input(shape=(None,))
+    y_in = Input(shape=(None,))
+
+    mask1 = Lambda(lambda x: 1 - x)(x2_in)
+    mask2 = x2_in
+
+    x = bert_model([x1_in, x2_in])
+
+    q1 = Lambda(lambda x: x * K.expand_dims(mask1, axis=-1))(x)
+    q2 = Lambda(lambda x: x * K.expand_dims(mask2, axis=-1))(x)
+    q1_combined, q2_combined = CoAttentionAndCombine('dot')([q1, mask1, q2, mask2])
+
+    x_50 = Dense(units=50, activation='relu')(x)  # (B, S, D)
+    c = Embedding(input_dim=5,
+                  output_dim=50,
+                  trainable=True)(c_in)
+    c = Lambda(lambda c: c[:, 0, :])(c)  # (B, D)
+
+    c = Attention()([c, x_50])
+
+    def reduce_mean_with_mask(x, mask):
+        dim = K.int_shape(x)[-1]
+        seq_len = K.expand_dims(K.sum(mask, 1), 1)  # (batch_size, 1)
+        # (batch_size, dim), unknown to the keras' broadcasting
+        seq_len_tiled = K.tile(seq_len, [1, dim])
+        x_sum = K.sum(x, axis=1)  # (batch_size, dim)
+        return x_sum / seq_len_tiled
+
+    def avg_mask1(x): return reduce_mean_with_mask(x, mask1)
+
+    def avg_mask2(x): return reduce_mean_with_mask(x, mask2)
+
+    def max_closure(x): return K.max(x, axis=1)
+
+    avg_op1 = Lambda(avg_mask1)
+    avg_op2 = Lambda(avg_mask2)
+    max_op = Lambda(max_closure)
+
+    q1_avg = avg_op1(q1_combined)
+    q1_max = max_op(q1_combined)
+    q2_avg = avg_op2(q2_combined)
+    q2_max = max_op(q2_combined)
+
+    x1_rep = Concatenate()([q1_avg, q1_max])
+    x2_rep = Concatenate()([q2_avg, q2_max])
+
+    merge_features = Concatenate()([x1_rep, x2_rep, c])
+
+    hidden = Dropout(0.5)(Dense(200, activation='relu')(merge_features))
+    p = Dense(1, activation='sigmoid')(hidden)
+
+    train_model = Model([x1_in, x2_in, c_in, y_in], p)
+    model = Model([x1_in, x2_in, c_in], p)
+
+    loss = K.mean(K.binary_crossentropy(target=y_in, output=p))
+    train_model.add_loss(loss)
+
+    train_model.compile(optimizer=Adam(learning_rate))
+    train_model.summary()
+
+    return train_model, model
+
+
 def train(train_model, train_ds, valid_ds, model_name):
 
     evaluator = Evaluator(model_name=model_name, valid_ds=valid_ds, patience=5)
@@ -450,7 +521,7 @@ def gen_stacking_features(weights_root_path, model_name):
     test_probs = []
     for weight in os.listdir(weights_root_path):
         _mode = int(weight.split('_')[1])
-        train_model, _ = create_bert_esim_model()  # todo: be easy to modify it
+        train_model, _ = create_bert_esim_add_category_model()  # todo: be easy to modify it
         train_model.load_weights(weights_root_path / weight)
 
         _valid_data = [aids_data[j] for i, j in enumerate(random_order_2500) if i % 10 == _mode] + \
@@ -472,7 +543,7 @@ def gen_stacking_features(weights_root_path, model_name):
         K.clear_session()
 
         # todo: the next is dealing with the abundant calling
-        _, model = create_bert_esim_model()
+        _, model = create_bert_esim_add_category_model()
         model.load_weights(weights_root_path / weight)
         test_probs.append(
             np.squeeze(
@@ -539,16 +610,16 @@ if __name__ == "__main__":
 
         _test_ds = DataGenerator(test_data, batch_size=16, test=True)
 
-        _train_model, _model = create_bert_esim_model()  # todo: be easy to modify it
+        _train_model, _model = create_bert_esim_add_category_model()  # todo: be easy to modify it
 
         train(
             train_model=_train_model,
             train_ds=_train_ds,
             valid_ds=_valid_ds,
-            model_name="esim_lstm_bert")
+            model_name="esim_bert_add_category")
         logger.info("___Reset The Computing Graph___")
         K.clear_session()
-    gen_stacking_features(Path(MODEL_SAVED) / "esim_lstm_bert", "esim_lstm_bert")
+    gen_stacking_features(Path(MODEL_SAVED) / "esim_bert_add_category", "esim_bert_add_category")
 
     # wdir = './model_saved/esim_bert/'
     # for old_name in os.listdir(wdir):
