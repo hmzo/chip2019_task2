@@ -32,12 +32,31 @@ random_order_18000 = np.fromfile("./random_order_18000.npy", dtype=np.int32)
 
 
 train_features_labels = list()
-train_features_labels.append(pd.read_csv(
-    ROOT / "base_bert_stacking_new_train.csv"))
-# train_features_labels.append(pd.read_csv(
-#     ROOT / "base_esim_stacking_new_train.csv"))
+# =========================================================================
+train_features_labels.append(pd.read_csv(ROOT / "base_bert_2_stacking_new_train.csv"))
+train_features_labels.append(pd.read_csv(ROOT / "base_bert_add_category_2_stacking_new_train.csv"))
+train_features_labels.append(pd.read_csv(ROOT / "base_bert_add_category_stacking_new_train.csv"))
+train_features_labels.append(pd.read_csv(ROOT / "robert_bert_stacking_new_train.csv"))
+train_features_labels.append(pd.read_csv(ROOT / "esim_bert_3_stacking_new_train.csv"))
+train_features_labels.append(pd.read_csv(ROOT / "esim_bert_add_category_3_stacking_new_train.csv"))
+train_features_labels.append(pd.read_csv(ROOT / "base_bert_add_category_transfer_v2_stacking_new_train.csv"))
+# =========================================================================
+
+test_features = list()
+# =========================================================================
+test_features.append(pd.read_csv(ROOT / "base_bert_2_stacking_new_test.csv"))
+test_features.append(pd.read_csv(ROOT / "base_bert_add_category_2_stacking_new_test.csv"))
+test_features.append(pd.read_csv(ROOT / "base_bert_add_category_stacking_new_test.csv"))
+test_features.append(pd.read_csv(ROOT / "robert_bert_stacking_new_test.csv"))
+test_features.append(pd.read_csv(ROOT / "esim_bert_3_stacking_new_test.csv"))
+test_features.append(pd.read_csv(ROOT / "esim_bert_add_category_3_stacking_new_test.csv"))
+test_features.append(pd.read_csv(ROOT / "base_bert_add_category_transfer_v2_stacking_new_test.csv"))
+# =========================================================================
+
+train_features_labels[0].columns = ['id', 'probs_0', 'label']
 result = train_features_labels[0]
 for i in range(1, len(train_features_labels)):
+    train_features_labels[i].columns = ['id', 'probs_%d' % i, 'label']
     result = pd.merge(
         left=result, right=train_features_labels[i], on=[
             "id", "label"])
@@ -80,12 +99,10 @@ for index, row in result.iterrows():
                                   row["label"],
                                   row["id"]))
 
-
-test_features = list()
-test_features.append(pd.read_csv(ROOT / "base_bert_stacking_new_test.csv"))
-# test_features.append(pd.read_csv(ROOT / "base_esim_stacking_new_test.csv"))
+test_features[0].columns = ['id', 'probs_0']
 test_result = test_features[0]
 for i in range(1, len(test_features)):
+    test_features[i].columns = ['id', 'probs_%d' % i]
     test_result = pd.merge(left=test_result, right=test_features[i], on=["id"])
 test_category = pd.read_csv(ROOT / "dev_id.csv")[['id', 'category']]
 test_result = pd.merge(left=test_result, right=test_category, on=['id'])
@@ -328,4 +345,13 @@ if __name__ == "__main__":
     stacker.fit(X_train, y_train)
     X_test = test_result[probs].values
     output = pd.DataFrame({"id": test_result["id"], "label": stacker.predict(X_test).astype(np.int32)})
-    output.to_csv(OUTPUT / "ensemble_base_bert_by_sklearn_lr_stacking.csv", index=False)
+
+    # rlt = stacker.predict_proba(X_test)[:, 1]
+    # binary_classifier_threshold = rlt.mean()
+    # for i in range(len(rlt)):
+    #     if rlt[i] > binary_classifier_threshold:
+    #         rlt[i] = 1
+    #     else:
+    #         rlt[i] = 0
+    # output = pd.DataFrame({"id": test_result["id"], "label": rlt.astype(np.int32)})
+    output.to_csv(OUTPUT / "ensemble_robert_esimedbert_add_category_3_by_sklearn_lr_stacking.csv", index=False)
