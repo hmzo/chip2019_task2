@@ -25,6 +25,7 @@ if not os.path.exists(MODEL_SAVED):
     os.makedirs(MODEL_SAVED)
 
 mode = None
+batch_size = 16
 max_seq_len = 512
 learning_rate = 5e-5
 min_learning_rate = 1e-5
@@ -88,7 +89,7 @@ for index, row in pd.read_csv(ROOT / "train_id.csv").iterrows():
                                   row['id']))
 
 new_data = []
-for index, row in pd.read_csv(ROOT / "new_train_id.csv").iterrows():
+for index, row in pd.read_csv(ROOT / "new_train_id_v2.csv").iterrows():
     new_data.append((row['question1'],
                      row['question2'],
                      row['category'],
@@ -516,7 +517,7 @@ def gen_stacking_features(weights_root_path, model_name):
     valid_true_labels = []
     valid_probs = []
     valid_ids = []
-    mode_test_ds = DataGenerator(test_data, batch_size=16, test=True)
+    mode_test_ds = DataGenerator(test_data, batch_size=batch_size, test=True)
     test_ids = mode_test_ds.ID
     test_probs = []
     for weight in os.listdir(weights_root_path):
@@ -530,7 +531,7 @@ def gen_stacking_features(weights_root_path, model_name):
                       [breast_cancer_data[j] for i, j in enumerate(random_order_2500) if i % 10 == _mode] + \
                       [diabetes_data[j] for i, j in enumerate(random_order_10000) if i % 10 == _mode]
 
-        mode_valid_ds = DataGenerator(_valid_data, batch_size=16, test=False)
+        mode_valid_ds = DataGenerator(_valid_data, batch_size=batch_size, test=False)
         valid_true_labels.append(mode_valid_ds.all_labels)
         valid_ids.append(mode_valid_ds.ID)
 
@@ -579,8 +580,8 @@ def get_loss(weights_path: str):
                   [hepatitis_data[j] for i, j in enumerate(random_order_2500) if i % 10 == _mode] + \
                   [breast_cancer_data[j] for i, j in enumerate(random_order_2500) if i % 10 == _mode] + \
                   [diabetes_data[j] for i, j in enumerate(random_order_10000) if i % 10 == _mode]
-    ds = DataGenerator(_valid_data, batch_size=32, test=False)
-    tm, m = create_bert_esim_model()
+    ds = DataGenerator(_valid_data, batch_size=batch_size, test=False)
+    tm, m = create_bert_esim_add_category_model()
 
     tm.load_weights(weights_path)
     tm.compile(optimizer=Adam())
@@ -603,12 +604,12 @@ if __name__ == "__main__":
                      [breast_cancer_data[j] for i, j in enumerate(random_order_2500) if i % 10 == mode] + \
                      [diabetes_data[j] for i, j in enumerate(random_order_10000) if i % 10 == mode]
 
-        # train_data = train_data + new_data
-        _train_ds = DataGenerator(train_data, batch_size=16, test=False)
+        train_data = train_data + new_data
+        _train_ds = DataGenerator(train_data, batch_size=batch_size, test=False)
 
-        _valid_ds = DataGenerator(valid_data, batch_size=16, test=False)
+        _valid_ds = DataGenerator(valid_data, batch_size=batch_size, test=False)
 
-        _test_ds = DataGenerator(test_data, batch_size=16, test=True)
+        _test_ds = DataGenerator(test_data, batch_size=batch_size, test=True)
 
         _train_model, _model = create_bert_esim_add_category_model()  # todo: be easy to modify it
 
@@ -616,10 +617,10 @@ if __name__ == "__main__":
             train_model=_train_model,
             train_ds=_train_ds,
             valid_ds=_valid_ds,
-            model_name="esim_bert_add_category")
+            model_name="esim_bert_add_category_transfer_v2")
         logger.info("___Reset The Computing Graph___")
         K.clear_session()
-    gen_stacking_features(Path(MODEL_SAVED) / "esim_bert_add_category", "esim_bert_add_category")
+    gen_stacking_features(Path(MODEL_SAVED) / "esim_bert_add_category_4", "esim_bert_add_category_4")
 
     # wdir = './model_saved/esim_bert/'
     # for old_name in os.listdir(wdir):

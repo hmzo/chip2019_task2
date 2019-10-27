@@ -4,11 +4,12 @@ import pandas as pd
 import codecs
 import os
 import logging
+from typing import Tuple, List
 
 import tensorflow as tf
 import keras.backend as K
 from sklearn.metrics import f1_score, precision_score, recall_score
-from keras.layers import Input, Embedding, Lambda, Dense, Layer
+from keras.layers import Input, Embedding, Lambda, Dense, Layer, Concatenate, Dropout, Bidirectional, LSTM
 from keras.models import Model
 from keras.optimizers import Adam
 from keras.callbacks import Callback
@@ -17,16 +18,15 @@ from keras_bert import load_trained_model_from_checkpoint, Tokenizer, AdamWarmup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-
 ROOT = Path("./data")
 MODEL_SAVED = Path("./model_saved")
+
 
 if not os.path.exists(MODEL_SAVED):
     os.makedirs(MODEL_SAVED)
 
-
 mode = None
-batch_size = 25
+batch_size = 16
 max_seq_len = 512
 learning_rate = 5e-5
 min_learning_rate = 1e-5
@@ -39,7 +39,6 @@ random_order_2000 = np.fromfile("./random_order_2000.npy", np.int32)
 random_order_2500 = np.fromfile("./random_order_2500.npy", dtype=np.int32)
 random_order_10000 = np.fromfile("./random_order_10000.npy", dtype=np.int32)
 random_order_18000 = np.fromfile("./random_order_18000.npy", dtype=np.int32)
-
 
 categories = ["aids", "breast_cancer", "diabetes", "hepatitis", "hypertension"]
 
@@ -210,38 +209,48 @@ class DataGenerator:
     def iterator(self):
         while True:
             if not self.test:
-                X1, X2, C, Y = [], [], [], []
+                X1, X1_, X2, X2_, C, Y = [], [], [], [], [], []
                 for i in self.idxs:
                     d = self.data[i]
-                    x1, x2 = tokenizer.encode(first=d[0], second=d[1])
+                    x1, x1_ = tokenizer.encode(first=d[0])
+                    x2, x2_ = tokenizer.encode(first=d[1])
                     c, y = d[2], d[3]
                     X1.append(x1)
+                    X1_.append(x1_)
                     X2.append(x2)
+                    X2_.append(x2_)
                     C.append([categories.index(c)])
                     Y.append([y])
                     if len(X1) == self.batch_size or i == self.idxs[-1]:
                         X1 = seq_padding(X1)
+                        X1_ = seq_padding(X1_)
                         X2 = seq_padding(X2)
+                        X2_ = seq_padding(X2_)
                         C = seq_padding(C)
                         Y = seq_padding(Y)
                         # todo: too abundant to use the generator
-                        yield [X1, X2, C, Y], None
-                        X1, X2, C, Y = [], [], [], []
+                        yield [X1, X1_, X2, X2_, C, Y], None
+                        X1, X1_, X2, X2_, C, Y = [], [], [], [], [], []
             elif self.test:
-                X1, X2, C = [], [], []
+                X1, X1_, X2, X2_, C = [], [], [], [], []
                 for i in range(len(self.data)):
                     d = self.data[i]
-                    x1, x2 = tokenizer.encode(first=d[0], second=d[1])
+                    x1, x1_ = tokenizer.encode(first=d[0])
+                    x2, x2_ = tokenizer.encode(first=d[1])
                     c = d[2]
                     X1.append(x1)
+                    X1_.append(x1_)
                     X2.append(x2)
+                    X2_.append(x2_)
                     C.append([categories.index(c)])
                     if len(X1) == self.batch_size or i == len(self.data) - 1:
                         X1 = seq_padding(X1)
+                        X1_ = seq_padding(X1_)
                         X2 = seq_padding(X2)
+                        X2_ = seq_padding(X2_)
                         C = seq_padding(C)
-                        yield [X1, X2, C], None
-                        X1, X2, C = [], [], []
+                        yield [X1, X1_, X2, X2_, C], None
+                        X1, X1_, X2, X2_, C = [], [], [], [], []
 
     def _get_all_label_as_ndarray(self):
         if self.test:
@@ -263,33 +272,6 @@ def seq_padding(seqs, padding=0):
     max_len = max(lens)
     return np.array([np.concatenate([x, [padding] * (max_len - len(x))])
                      if len(x) < max_len else x for x in seqs])
-
-
-def create_base_bert_model():
-    bert_model = load_trained_model_from_checkpoint(
-        config_path, checkpoint_path, seq_len=None)
-    for l in bert_model.layers:
-        l.trainable = True
-
-    x1_in = Input(shape=(None,))
-    x2_in = Input(shape=(None,))
-    c_in = Input(shape=(None,))
-    y_in = Input(shape=(None,))
-
-    x = bert_model([x1_in, x2_in])
-    x = Lambda(lambda x: x[:, 0, :])(x)  # [CLS]
-
-    p = Dense(1, activation='sigmoid')(x)
-    train_model = Model([x1_in, x2_in, c_in, y_in], p)
-    model = Model([x1_in, x2_in, c_in], p)
-
-    loss = K.mean(K.binary_crossentropy(target=y_in, output=p))
-    train_model.add_loss(loss)
-
-    train_model.compile(optimizer=Adam(learning_rate))
-    train_model.summary()
-
-    return train_model, model
 
 
 class Attention(Layer):
@@ -322,35 +304,201 @@ class Attention(Layer):
         return [input_shape[0]]
 
 
-def create_bert_concat_category_embedding_model():
+class CoAttentionAndCombine(Layer):
+    def __init__(self, atype):
+        super(CoAttentionAndCombine, self).__init__()
+        self.atype = atype
+        self.supports_masking = True
+
+    def build(self, input_shape):
+        # Used purely for shape validation.
+        if len(input_shape) != 4:
+            raise ValueError(
+                'A `CoAttentionAndCombine` layer should be called '
+                'on a list of 4 inputs')
+        if all([shape is None for shape in input_shape]):
+            return
+        inputs_shapes = [list(shape)
+                         for shape in input_shape]  # (x1, m1, x2, m2)
+        if self.atype == 'bi_linear':
+            self.bi_linear_w = self.add_weight(name='bi_linear_w',
+                                               initializer='random_normal',
+                                               shape=(inputs_shapes[0][-1], inputs_shapes[0][-1]),
+                                               trainable=True)
+        self.built = True
+
+    def call(self, inputs, **kwargs):
+        x1 = inputs[0]
+        m1 = tf.expand_dims(inputs[1], axis=2)  # (batch_size, seq_len1, 1)
+        x2 = inputs[2]
+        m2 = tf.expand_dims(inputs[3], axis=1)  # (batch_size, 1, seq_len2)
+        mask_similarity_matrix = tf.matmul(
+            m1, m2)  # (batch_size, seq_len1, seq_len2)
+        mask_similarity_matrix = (mask_similarity_matrix - 1.) * 10000
+        similarity_matrix: object = None
+        if self.atype == 'dot':
+            # (batch_size, seq_len1, seq_len2)
+            similarity_matrix = tf.matmul(x1, x2, transpose_b=True)
+        elif self.atype == 'bi_linear':
+            similarity_matrix = tf.matmul(
+                tf.tensordot(
+                    x1, self.bi_linear_w, [
+                        [2], [0]]), x2, transpose_b=True)
+        assert similarity_matrix is not None, "type %s is not in ['dot', 'bi_linear']" % self.atype
+
+        similarity_matrix = tf.add(similarity_matrix, mask_similarity_matrix)
+        similarity_matrix_transpose = tf.transpose(
+            similarity_matrix, perm=[0, 2, 1])
+
+        alpha1 = tf.nn.softmax(similarity_matrix_transpose, axis=-1)
+        alpha2 = tf.nn.softmax(similarity_matrix, axis=-1)
+
+        x1_tilde = tf.matmul(alpha2, x2)
+        x2_tilde = tf.matmul(alpha1, x1)
+
+        m1 = tf.concat([x1, x1_tilde, tf.abs(tf.subtract(
+            x1, x1_tilde)), tf.multiply(x1, x1_tilde)], axis=-1)
+        m2 = tf.concat([x2, x2_tilde, tf.abs(tf.subtract(
+            x2, x2_tilde)), tf.multiply(x2, x2_tilde)], axis=-1)
+        output: List = [m1, m2]  # ***output must be a List***
+        return output
+
+    def compute_output_shape(self, input_shape: List[Tuple]) -> List[Tuple]:
+        output_shapes: List[Tuple] = list()  # ***element must be a tuple***
+        input_shapes = [input_shape[0], input_shape[2]]  # do not output mask
+        for x in input_shapes:
+            output_shapes.append((x[0], x[1], 4 * x[2]))
+        return output_shapes
+
+
+def create_siamese_bert_esim_model():
     bert_model = load_trained_model_from_checkpoint(
         config_path, checkpoint_path, seq_len=None)
     for l in bert_model.layers:
         l.trainable = True
 
     x1_in = Input(shape=(None,))
+    m1_in = Input(shape=(None,))
     x2_in = Input(shape=(None,))
+    m2_in = Input(shape=(None,))
     c_in = Input(shape=(None,))
     y_in = Input(shape=(None,))
 
-    x = bert_model([x1_in, x2_in])
+    mask1 = Lambda(lambda x: K.cast(K.greater(x, 0), 'float32'))(x1_in)
+    mask2 = Lambda(lambda x: K.cast(K.greater(x, 0), 'float32'))(x2_in)
 
-    # -----------bert_concat_category_embedding-------------
-    x = Dense(units=50, activation='relu')(x)  # (B, S, D)
-    x_cls = Lambda(lambda x: x[:, 0, :])(x)  # [CLS]
+    q1 = bert_model([x1_in, m1_in])
+    q2 = bert_model([x2_in, m2_in])
+
+    q1_combined, q2_combined = CoAttentionAndCombine('dot')([q1, mask1, q2, mask2])
+
+    def reduce_mean_with_mask(x, mask):
+        dim = K.int_shape(x)[-1]
+        seq_len = K.expand_dims(K.sum(mask, 1), 1)  # (batch_size, 1)
+        # (batch_size, dim), unknown to the keras' broadcasting
+        seq_len_tiled = K.tile(seq_len, [1, dim])
+        x_sum = K.sum(x, axis=1)  # (batch_size, dim)
+        return x_sum / seq_len_tiled
+
+    def avg_mask1(x): return reduce_mean_with_mask(x, mask1)
+
+    def avg_mask2(x): return reduce_mean_with_mask(x, mask2)
+
+    def max_closure(x): return K.max(x, axis=1)
+
+    avg_op1 = Lambda(avg_mask1)
+    avg_op2 = Lambda(avg_mask2)
+    max_op = Lambda(max_closure)
+
+    q1_avg = avg_op1(q1_combined)
+    q1_max = max_op(q1_combined)
+    q2_avg = avg_op2(q2_combined)
+    q2_max = max_op(q2_combined)
+
+    x1_rep = Concatenate()([q1_avg, q1_max])
+    x2_rep = Concatenate()([q2_avg, q2_max])
+
+    merge_features = Concatenate()([x1_rep, x2_rep])
+
+    hidden = Dropout(0.5)(Dense(200, activation='relu')(merge_features))
+    p = Dense(1, activation='sigmoid')(hidden)
+
+    train_model = Model([x1_in, m1_in, x2_in, m2_in, c_in, y_in], p)
+    model = Model([x1_in, m1_in, x2_in, m2_in, c_in], p)
+
+    loss = K.mean(K.binary_crossentropy(target=y_in, output=p))
+    train_model.add_loss(loss)
+
+    train_model.compile(optimizer=Adam(learning_rate))
+    train_model.summary()
+
+    return train_model, model
+
+
+def create_siamese_bert_esim_add_category_model():
+    bert_model = load_trained_model_from_checkpoint(
+        config_path, checkpoint_path, seq_len=None)
+    for l in bert_model.layers:
+        l.trainable = True
+
+    x1_in = Input(shape=(None,))
+    m1_in = Input(shape=(None,))
+    x2_in = Input(shape=(None,))
+    m2_in = Input(shape=(None,))
+    c_in = Input(shape=(None,))
+    y_in = Input(shape=(None,))
+
+    mask1 = Lambda(lambda x: K.cast(K.greater(x, 0), 'float32'))(x1_in)
+    mask2 = Lambda(lambda x: K.cast(K.greater(x, 0), 'float32'))(x2_in)
+
+    q1 = bert_model([x1_in, m1_in])
+    q2 = bert_model([x2_in, m2_in])
+
+    q1_combined, q2_combined = CoAttentionAndCombine('dot')([q1, mask1, q2, mask2])
+
+    q1_50 = Dense(units=50, activation='relu')(q1)  # (B, S, D)
+    q2_50 = Dense(units=50, activation='relu')(q2)
     c = Embedding(input_dim=5,
                   output_dim=50,
                   trainable=True)(c_in)
     c = Lambda(lambda c: c[:, 0, :])(c)  # (B, D)
 
-    c = Attention()([c, x])
+    c_q1 = Attention()([c, q1_50])
+    c_q2 = Attention()([c, q2_50])
 
-    x_c_concat = Lambda(K.concatenate)([x_cls, c])
-    # ------------------------------------------------------
+    def reduce_mean_with_mask(x, mask):
+        dim = K.int_shape(x)[-1]
+        seq_len = K.expand_dims(K.sum(mask, 1), 1)  # (batch_size, 1)
+        # (batch_size, dim), unknown to the keras' broadcasting
+        seq_len_tiled = K.tile(seq_len, [1, dim])
+        x_sum = K.sum(x, axis=1)  # (batch_size, dim)
+        return x_sum / seq_len_tiled
 
-    p = Dense(1, activation='sigmoid')(x_c_concat)
-    train_model = Model([x1_in, x2_in, c_in, y_in], p)
-    model = Model([x1_in, x2_in, c_in], p)
+    def avg_mask1(x): return reduce_mean_with_mask(x, mask1)
+
+    def avg_mask2(x): return reduce_mean_with_mask(x, mask2)
+
+    def max_closure(x): return K.max(x, axis=1)
+
+    avg_op1 = Lambda(avg_mask1)
+    avg_op2 = Lambda(avg_mask2)
+    max_op = Lambda(max_closure)
+
+    q1_avg = avg_op1(q1_combined)
+    q1_max = max_op(q1_combined)
+    q2_avg = avg_op2(q2_combined)
+    q2_max = max_op(q2_combined)
+
+    x1_rep = Concatenate()([q1_avg, q1_max])
+    x2_rep = Concatenate()([q2_avg, q2_max])
+
+    merge_features = Concatenate()([x1_rep, x2_rep, c_q1, c_q2])
+
+    hidden = Dropout(0.5)(Dense(200, activation='relu')(merge_features))
+    p = Dense(1, activation='sigmoid')(hidden)
+
+    train_model = Model([x1_in, m1_in, x2_in, m2_in, c_in, y_in], p)
+    model = Model([x1_in, m1_in, x2_in, m2_in, c_in], p)
 
     loss = K.mean(K.binary_crossentropy(target=y_in, output=p))
     train_model.add_loss(loss)
@@ -374,30 +522,6 @@ def train(train_model, train_ds, valid_ds, model_name):
                               callbacks=[evaluator])
 
 
-def predict(model, weights_path, test_ds):
-    model.load_weights(weights_path)
-    probs = model.predict_generator(test_ds.iterator(), steps=len(test_ds))
-    probs = np.squeeze(probs)
-
-    preds = []
-
-    for i in range(len(probs)):
-        if probs[i] > binary_classifier_threshold:
-            preds.append(1)
-        else:
-            preds.append(0)
-    preds = np.array(preds, dtype=np.int32)
-
-    ids = test_ds.ID
-
-    _valid_result = pd.DataFrame({"id": ids, "label": preds})
-    _valid_logits = pd.DataFrame({"id": ids, "logits": probs})
-
-    _valid_result.to_csv(
-        "./output/simple_bert_output.csv",
-        index=False)
-
-
 def gen_stacking_features(weights_root_path, model_name):
     valid_true_labels = []
     valid_probs = []
@@ -407,7 +531,7 @@ def gen_stacking_features(weights_root_path, model_name):
     test_probs = []
     for weight in os.listdir(weights_root_path):
         _mode = int(weight.split('_')[1])
-        train_model, _ = create_bert_concat_category_embedding_model()  # todo: be easy to modify it
+        train_model, _ = create_siamese_bert_esim_model()  # todo: be easy to modify it
         train_model.load_weights(weights_root_path / weight)
 
         _valid_data = [aids_data[j] for i, j in enumerate(random_order_2500) if i % 10 == _mode] + \
@@ -429,7 +553,7 @@ def gen_stacking_features(weights_root_path, model_name):
         K.clear_session()
 
         # todo: the next is dealing with the abundant calling
-        _, model = create_bert_concat_category_embedding_model()
+        _, model = create_siamese_bert_esim_model()
         model.load_weights(weights_root_path / weight)
         test_probs.append(
             np.squeeze(
@@ -466,10 +590,7 @@ def get_loss(weights_path: str):
                   [breast_cancer_data[j] for i, j in enumerate(random_order_2500) if i % 10 == _mode] + \
                   [diabetes_data[j] for i, j in enumerate(random_order_10000) if i % 10 == _mode]
     ds = DataGenerator(_valid_data, batch_size=batch_size, test=False)
-    if 'category' in weights_path.split('/')[-2].split('_'):
-        tm, m = create_bert_concat_category_embedding_model()
-    else:
-        tm, m = create_base_bert_model()
+    tm, m = create_siamese_bert_esim_model()
 
     tm.load_weights(weights_path)
     tm.compile(optimizer=Adam())
@@ -480,6 +601,12 @@ def get_loss(weights_path: str):
 
 if __name__ == "__main__":
     for mode in range(10):
+
+        config = tf.ConfigProto()
+        config.gpu_options.allow_growth = True
+        sess = tf.Session(config=config)
+        K.set_session(sess)
+
         train_data = [aids_data[j] for i, j in enumerate(random_order_2500) if i % 10 != mode] + \
                      [hypertension_data[j] for i, j in enumerate(random_order_2500) if i % 10 != mode] + \
                      [hepatitis_data[j] for i, j in enumerate(random_order_2500) if i % 10 != mode] + \
@@ -492,33 +619,25 @@ if __name__ == "__main__":
                      [breast_cancer_data[j] for i, j in enumerate(random_order_2500) if i % 10 == mode] + \
                      [diabetes_data[j] for i, j in enumerate(random_order_10000) if i % 10 == mode]
 
-        inverse_train_data = []
-        for x in train_data:
-            inverse_train_data.append((x[1], x[0], x[2], x[3], x[4]))
-
-        train_data = train_data + new_data
+        train_data = train_data
         _train_ds = DataGenerator(train_data, batch_size=batch_size, test=False)
 
         _valid_ds = DataGenerator(valid_data, batch_size=batch_size, test=False)
 
         _test_ds = DataGenerator(test_data, batch_size=batch_size, test=True)
 
-        _train_model, _model = create_bert_concat_category_embedding_model()  # todo: be easy to modify it
+        _train_model, _model = create_siamese_bert_esim_model()  # todo: be easy to modify it
 
         train(
             train_model=_train_model,
             train_ds=_train_ds,
             valid_ds=_valid_ds,
-            model_name="base_bert_add_category_transfer_v2")
+            model_name="siamese_esim_bert")
         logger.info("___Reset The Computing Graph___")
         K.clear_session()
-    gen_stacking_features(Path(MODEL_SAVED) / "base_bert_add_category_transfer_v2", "base_bert_add_category_transfer_v2")
+    gen_stacking_features(Path(MODEL_SAVED) / "siamese_esim_bert", "siamese_esim_bert")
 
-    # _, model = create_base_bert_model()
-    # test_ds = DataGenerator(test_data, test=True)
-    # predict(model, "", test_ds)
-
-    # wdir = './model_saved/base_bert_transfer_1/'
+    # wdir = './model_saved/esim_bert/'
     # for old_name in os.listdir(wdir):
     #     if 'loss' not in old_name.split('_'):
     #         loss = get_loss(wdir + old_name)
