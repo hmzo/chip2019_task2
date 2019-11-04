@@ -1,5 +1,4 @@
 from pathlib import Path
-import numpy as np
 import pandas as pd
 import sqlite3
 import os
@@ -11,7 +10,6 @@ from typing import List, Tuple
 
 import tensorflow as tf
 
-import keras.backend as K
 from sklearn.metrics import f1_score, precision_score, recall_score
 from keras.layers import *
 from keras.models import Model
@@ -559,8 +557,6 @@ if __name__ == "__main__":
         K.set_session(sess)
 
         max_pos_weight = 0.5
-        # pos_weight = 0.1
-        # 后期因为pos_weight过小可能会导致训练收敛过慢,可以适当放宽对recall的限制
         pos_weight = K.variable(0.1, dtype="float32", name="pos_weight")
 
         train_data = [aids_data[j] for i, j in enumerate(random_order_2500) if i % 10 != mode] + \

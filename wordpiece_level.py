@@ -12,13 +12,14 @@ from keras.layers import Input, Embedding, Lambda, Dense, Layer
 from keras.models import Model
 from keras.optimizers import Adam
 from keras.callbacks import Callback
-from keras_bert import load_trained_model_from_checkpoint, Tokenizer, AdamWarmup
+from keras_bert import load_trained_model_from_checkpoint, Tokenizer
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 ROOT = Path("./data")
+TEST_ROOT = Path("./final_data")
 MODEL_SAVED = Path("./model_saved")
 
 if not os.path.exists(MODEL_SAVED):
@@ -26,7 +27,7 @@ if not os.path.exists(MODEL_SAVED):
 
 
 mode = None
-batch_size = 25
+batch_size = 32
 max_seq_len = 512
 learning_rate = 5e-5
 min_learning_rate = 1e-5
@@ -99,7 +100,7 @@ for index, row in pd.read_csv(ROOT / "new_train_id_v2.csv").iterrows():
                      row['id']))
 
 test_data = []
-for index, row in pd.read_csv(ROOT / "dev_id.csv").iterrows():
+for index, row in pd.read_csv(TEST_ROOT / "test_final.csv").iterrows():
     test_data.append(
         (row['question1'],
          row['question2'],
@@ -287,7 +288,7 @@ def create_base_bert_model():
     train_model.add_loss(loss)
 
     train_model.compile(optimizer=Adam(learning_rate))
-    train_model.summary()
+    # train_model.summary()
 
     return train_model, model
 
@@ -322,7 +323,7 @@ class Attention(Layer):
         return [input_shape[0]]
 
 
-def create_bert_concat_category_embedding_model():
+def create_bert_append_category_info():
     bert_model = load_trained_model_from_checkpoint(
         config_path, checkpoint_path, seq_len=None)
     for l in bert_model.layers:
@@ -335,7 +336,6 @@ def create_bert_concat_category_embedding_model():
 
     x = bert_model([x1_in, x2_in])
 
-    # -----------bert_concat_category_embedding-------------
     x = Dense(units=50, activation='relu')(x)  # (B, S, D)
     x_cls = Lambda(lambda x: x[:, 0, :])(x)  # [CLS]
     c = Embedding(input_dim=5,
@@ -346,7 +346,6 @@ def create_bert_concat_category_embedding_model():
     c = Attention()([c, x])
 
     x_c_concat = Lambda(K.concatenate)([x_cls, c])
-    # ------------------------------------------------------
 
     p = Dense(1, activation='sigmoid')(x_c_concat)
     train_model = Model([x1_in, x2_in, c_in, y_in], p)
@@ -356,7 +355,6 @@ def create_bert_concat_category_embedding_model():
     train_model.add_loss(loss)
 
     train_model.compile(optimizer=Adam(learning_rate))
-    train_model.summary()
 
     return train_model, model
 
@@ -367,7 +365,7 @@ def train(train_model, train_ds, valid_ds, model_name):
 
     train_model.fit_generator(train_ds.iterator(),
                               steps_per_epoch=len(train_ds),
-                              epochs=30,
+                              epochs=5,
                               class_weight="auto",
                               validation_data=valid_ds.iterator(),
                               validation_steps=len(valid_ds),
@@ -407,7 +405,7 @@ def gen_stacking_features(weights_root_path, model_name):
     test_probs = []
     for weight in os.listdir(weights_root_path):
         _mode = int(weight.split('_')[1])
-        train_model, _ = create_bert_concat_category_embedding_model()  # todo: be easy to modify it
+        train_model, _ = create_base_bert_model()  # todo: be easy to modify it
         train_model.load_weights(weights_root_path / weight)
 
         _valid_data = [aids_data[j] for i, j in enumerate(random_order_2500) if i % 10 == _mode] + \
@@ -429,7 +427,7 @@ def gen_stacking_features(weights_root_path, model_name):
         K.clear_session()
 
         # todo: the next is dealing with the abundant calling
-        _, model = create_bert_concat_category_embedding_model()
+        _, model = create_base_bert_model()
         model.load_weights(weights_root_path / weight)
         test_probs.append(
             np.squeeze(
@@ -442,7 +440,7 @@ def gen_stacking_features(weights_root_path, model_name):
     to_vote_format = {"id": test_ids}
     for i, each in enumerate(test_probs):
         to_vote_format["label_%s" % str(i)] = np.array(each.round(), np.int32)
-    pd.DataFrame(to_vote_format).to_csv(ROOT / (model_name + "_predictions_for_vote.csv"), index=False)
+    pd.DataFrame(to_vote_format).to_csv(TEST_ROOT / (model_name + "_predictions_for_vote.csv"), index=False)
 
     valid_out = pd.DataFrame({"id": np.concatenate(valid_ids).astype(np.int32),
                               "probs": np.concatenate(valid_probs),
@@ -452,10 +450,10 @@ def gen_stacking_features(weights_root_path, model_name):
     test_out = pd.DataFrame(
         {"id": test_ids, "probs": np.mean(test_probs, axis=0)})
 
-    valid_out.to_csv(ROOT / (model_name + "_stacking_new_train.csv"),
+    valid_out.to_csv(TEST_ROOT / (model_name + "_stacking_new_train.csv"),
                      index=False)
     test_out.to_csv(
-        ROOT / (model_name + "_stacking_new_test.csv"), index=False)
+        TEST_ROOT / (model_name + "_stacking_new_test.csv"), index=False)
 
 
 def get_loss(weights_path: str):
@@ -467,7 +465,7 @@ def get_loss(weights_path: str):
                   [diabetes_data[j] for i, j in enumerate(random_order_10000) if i % 10 == _mode]
     ds = DataGenerator(_valid_data, batch_size=batch_size, test=False)
     if 'category' in weights_path.split('/')[-2].split('_'):
-        tm, m = create_bert_concat_category_embedding_model()
+        tm, m = create_base_bert_model()
     else:
         tm, m = create_base_bert_model()
 
@@ -480,6 +478,12 @@ def get_loss(weights_path: str):
 
 if __name__ == "__main__":
     for mode in range(10):
+
+        config = tf.ConfigProto()
+        config.gpu_options.allow_growth = True
+        sess = tf.Session(config=config)
+        K.set_session(sess)
+
         train_data = [aids_data[j] for i, j in enumerate(random_order_2500) if i % 10 != mode] + \
                      [hypertension_data[j] for i, j in enumerate(random_order_2500) if i % 10 != mode] + \
                      [hepatitis_data[j] for i, j in enumerate(random_order_2500) if i % 10 != mode] + \
@@ -496,32 +500,20 @@ if __name__ == "__main__":
         for x in train_data:
             inverse_train_data.append((x[1], x[0], x[2], x[3], x[4]))
 
-        train_data = train_data + new_data
         _train_ds = DataGenerator(train_data, batch_size=batch_size, test=False)
 
         _valid_ds = DataGenerator(valid_data, batch_size=batch_size, test=False)
 
         _test_ds = DataGenerator(test_data, batch_size=batch_size, test=True)
 
-        _train_model, _model = create_bert_concat_category_embedding_model()  # todo: be easy to modify it
+        _train_model, _model = create_base_bert_model()  # todo: be easy to modify it
 
         train(
             train_model=_train_model,
             train_ds=_train_ds,
             valid_ds=_valid_ds,
-            model_name="base_bert_add_category_transfer_v2")
+            model_name="bert")
         logger.info("___Reset The Computing Graph___")
         K.clear_session()
-    gen_stacking_features(Path(MODEL_SAVED) / "base_bert_add_category_transfer_v2", "base_bert_add_category_transfer_v2")
-
-    # _, model = create_base_bert_model()
-    # test_ds = DataGenerator(test_data, test=True)
-    # predict(model, "", test_ds)
-
-    # wdir = './model_saved/base_bert_transfer_1/'
-    # for old_name in os.listdir(wdir):
-    #     if 'loss' not in old_name.split('_'):
-    #         loss = get_loss(wdir + old_name)
-    #         new_name = old_name[:-8] + '_loss_%s.weights' % str(round(loss, 4))
-    #         os.renames(wdir + old_name, wdir + new_name)
+    gen_stacking_features(Path(MODEL_SAVED) / "bert", "bert")
 
